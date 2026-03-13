@@ -21,8 +21,10 @@
  */
 #include "postgres.h"
 
+#include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/heap.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage.h"
 #include "catalog/storage_gtt.h"
@@ -55,8 +57,11 @@
 typedef struct GttStorageEntry
 {
 	Oid			relid;			/* GTT's pg_class OID (hash key) */
+	Oid			toast_relid;	/* toast relation for heap entries, InvalidOid
+								 * if none / not a heap */
 	RelFileLocator locator;		/* per-session physical storage location */
 	bool		storage_created;	/* has smgr file been created? */
+	bool		on_commit_delete;	/* truncate data on commit? */
 	bool		drop_pending;	/* entry scheduled for drop at xact commit */
 	SubTransactionId create_subid;	/* subxact that added this entry */
 	SubTransactionId storage_subid; /* subxact that created current storage */
@@ -86,6 +91,7 @@ static void gtt_remove_entry(GttStorageEntry *entry);
 static void gtt_revert_storage(GttStorageEntry *entry);
 static void gtt_remove_relids(List *to_remove);
 static void gtt_init_entry(GttStorageEntry *entry, Relation relation);
+static void gtt_truncate_smgr(GttStorageEntry *entry);
 
 /*
  * ensure_gtt_hash
@@ -148,6 +154,41 @@ GttInitSessionStorage(Relation relation)
 	if (!found)
 		gtt_init_entry(entry, relation);
 
+	/*
+	 * Refresh on_commit_delete from the catalog reloption.  rd_options is not
+	 * populated on the very first call from heap_create, so the CREATE path
+	 * initially leaves this flag cleared; a subsequent relcache build (after
+	 * CCI during the same CREATE) supplies the reloption.
+	 *
+	 * The truncation itself is done from PreCommit_gtt_on_commit -- we do not
+	 * register an OnCommitItem because heap_truncate's AccessExclusiveLock
+	 * would conflict with peer sessions' session-level AccessShareLock on the
+	 * same GTT.
+	 */
+	if (relation->rd_options != NULL &&
+		relation->rd_rel->relkind == RELKIND_RELATION)
+	{
+		/*
+		 * The relkind check matters: rd_options is only StdRdOptions for
+		 * plain tables -- for other relkinds it can be a smaller
+		 * kind-specific struct, and reading on_commit_delete from it would
+		 * run off the end of the allocation.
+		 */
+		StdRdOptions *opts = (StdRdOptions *) relation->rd_options;
+
+		entry->on_commit_delete = opts->on_commit_delete;
+	}
+
+	/*
+	 * Remember the toast relation for heap entries, so the commit-time
+	 * on-commit-delete truncation can reach it without catalog access.  As
+	 * with on_commit_delete, rd_rel is not fully populated on the very first
+	 * call during CREATE; later relcache builds fill it in.
+	 */
+	if (relation->rd_rel->relkind == RELKIND_RELATION &&
+		OidIsValid(relation->rd_rel->reltoastrelid))
+		entry->toast_relid = relation->rd_rel->reltoastrelid;
+
 	/* Point the relation at our per-session storage */
 	relation->rd_locator = entry->locator;
 	relation->rd_backend = ProcNumberForTempRelations();
@@ -194,6 +235,8 @@ gtt_init_entry(GttStorageEntry *entry, Relation relation)
 	entry->create_subid = GetCurrentSubTransactionId();
 	gtt_xact_state_dirty = true;
 	entry->storage_subid = InvalidSubTransactionId;
+	entry->on_commit_delete = false;
+	entry->toast_relid = InvalidOid;
 }
 
 /*
@@ -495,6 +538,152 @@ gtt_subxact_callback(SubXactEvent event,
 	foreach(lc, to_invalidate)
 		RelationCacheInvalidateEntry(lfirst_oid(lc));
 	list_free(to_invalidate);
+}
+
+/*
+ * gtt_truncate_smgr
+ *		Truncate one entry's per-session storage to zero blocks via smgr.
+ *
+ * We cannot call RelationTruncate (which requires a Relation) because
+ * opening relations during commit-time hooks corrupts the relcache state
+ * that subsequent xacts rely on for DROP TABLE.  Truncating directly via
+ * smgr is sufficient: the storage is per-session and not visible to any
+ * other backend, so neither the AccessExclusiveLock RelationTruncate
+ * documents nor the relcache inval message it sends are needed for
+ * correctness here.
+ *
+ * The btree _bt_getroot fast path keeps a copy of the metapage in
+ * rd_amcache; that cache is dropped lazily by GttBuildIndexIfNeeded the
+ * next time the index is opened (added in a later commit), so we do not
+ * touch it here.
+ */
+static void
+gtt_truncate_smgr(GttStorageEntry *entry)
+{
+	SMgrRelation reln;
+	ForkNumber	forks[MAX_FORKNUM + 1];
+	BlockNumber old_blocks[MAX_FORKNUM + 1];
+	BlockNumber new_blocks[MAX_FORKNUM + 1];
+	int			nforks = 0;
+
+	if (!entry->storage_created)
+		return;
+
+	reln = smgropen(entry->locator, ProcNumberForTempRelations());
+
+	/* tolerate an already-vanished file (defense in depth) */
+	if (!smgrexists(reln, MAIN_FORKNUM))
+		return;
+
+	forks[nforks] = MAIN_FORKNUM;
+	old_blocks[nforks] = smgrnblocks(reln, MAIN_FORKNUM);
+	new_blocks[nforks] = 0;
+	nforks++;
+
+	if (smgrexists(reln, FSM_FORKNUM))
+	{
+		forks[nforks] = FSM_FORKNUM;
+		old_blocks[nforks] = smgrnblocks(reln, FSM_FORKNUM);
+		new_blocks[nforks] = 0;
+		nforks++;
+	}
+	if (smgrexists(reln, VISIBILITYMAP_FORKNUM))
+	{
+		forks[nforks] = VISIBILITYMAP_FORKNUM;
+		old_blocks[nforks] = smgrnblocks(reln, VISIBILITYMAP_FORKNUM);
+		new_blocks[nforks] = 0;
+		nforks++;
+	}
+
+	/*
+	 * Skip the truncation entirely if every fork is already empty: there is
+	 * then nothing in the local buffer pool for this relation either, so
+	 * smgrtruncate's buffer-drop pass and sinval message would be pure
+	 * overhead.  This matters because PreCommit_gtt_on_commit re-truncates
+	 * every ON COMMIT DELETE ROWS GTT the session has opened, at every
+	 * qualifying commit, written-to or not.
+	 */
+	while (nforks > 0 && old_blocks[nforks - 1] == 0)
+		nforks--;
+	if (nforks == 0)
+		return;
+
+	smgrtruncate(reln, forks, nforks, old_blocks, new_blocks);
+}
+
+/*
+ * PreCommit_gtt_on_commit
+ *		Truncate ON COMMIT DELETE ROWS GTTs at commit.
+ *
+ * Generic on-commit truncation in PreCommit_on_commit_actions cannot be
+ * used for GTTs: heap_truncate's AccessExclusiveLock would block on peers'
+ * ordinary transaction-level locks at every commit, and opening the relation
+ * via table_open at commit-time -- even with NoLock -- destabilises the
+ * relcache enough to break a subsequent DROP TABLE in the next xact.  So
+ * we register no OnCommitItem for GTTs (heap_create_with_catalog
+ * suppresses the generic registration; see register_on_commit_action()
+ * callers in heap.c) and truncate each session's local storage here
+ * directly through smgr, using the per-session locator that
+ * GttInitSessionStorage already recorded in our hash.
+ */
+void
+PreCommit_gtt_on_commit(void)
+{
+	HASH_SEQ_STATUS status;
+	GttStorageEntry *entry;
+	List	   *toast_relids = NIL;
+	ListCell   *lc;
+
+	if (gtt_storage_hash == NULL)
+		return;
+
+	/*
+	 * Match PreCommit_on_commit_actions's optimisation: skip when no temp
+	 * namespace was accessed in this xact, since any GTT we have storage for
+	 * is necessarily empty.
+	 */
+	if (!(MyXactFlags & XACT_FLAGS_ACCESSEDTEMPNAMESPACE))
+		return;
+
+	hash_seq_init(&status, gtt_storage_hash);
+	while ((entry = (GttStorageEntry *) hash_seq_search(&status)) != NULL)
+	{
+		if (!entry->on_commit_delete || !entry->storage_created)
+			continue;
+
+		/*
+		 * A heap whose main fork is already empty has not been written since
+		 * its last truncation; skip it -- and thereby its toast -- so that an
+		 * idle ON COMMIT DELETE ROWS table costs each commit no more than
+		 * this block-count probe.
+		 */
+		if (smgrnblocks(smgropen(entry->locator, ProcNumberForTempRelations()),
+						MAIN_FORKNUM) == 0)
+			continue;
+
+		gtt_truncate_smgr(entry);
+
+		/*
+		 * Queue the toast relation too (if this session ever wrote toasted
+		 * values, an entry for it exists).  Truncating just the heap would
+		 * orphan the toast rows for good: nothing else ever deletes them, and
+		 * autovacuum never visits GTTs.
+		 */
+		if (OidIsValid(entry->toast_relid))
+			toast_relids = lappend_oid(toast_relids, entry->toast_relid);
+	}
+
+	foreach(lc, toast_relids)
+	{
+		Oid			toast_relid = lfirst_oid(lc);
+
+		entry = (GttStorageEntry *) hash_search(gtt_storage_hash,
+												&toast_relid,
+												HASH_FIND, NULL);
+		if (entry != NULL && entry->storage_created)
+			gtt_truncate_smgr(entry);
+	}
+	list_free(toast_relids);
 }
 
 /*

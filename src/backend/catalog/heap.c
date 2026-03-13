@@ -1544,9 +1544,15 @@ heap_create_with_catalog(const char *relname,
 	StoreConstraints(new_rel_desc, cooked_constraints, is_internal);
 
 	/*
-	 * If there's a special on-commit action, remember it
+	 * If there's a special on-commit action, remember it.  Global temporary
+	 * tables manage their ON COMMIT DELETE ROWS truncation through
+	 * PreCommit_gtt_on_commit instead, since heap_truncate would escalate to
+	 * AccessExclusiveLock at every commit, blocking on peers' ordinary
+	 * transaction-level locks even though only this session's private storage
+	 * is affected; skip the generic registration here for GTTs.
 	 */
-	if (oncommit != ONCOMMIT_NOOP)
+	if (oncommit != ONCOMMIT_NOOP &&
+		relpersistence != RELPERSISTENCE_GLOBAL_TEMP)
 		register_on_commit_action(relid, oncommit);
 
 	/*

@@ -397,6 +397,7 @@ typedef struct PartitionIndexExtDepEntry
 	((child_is_partition) ? DEPENDENCY_AUTO : DEPENDENCY_NORMAL)
 
 static void truncate_check_rel(Oid relid, Form_pg_class reltuple);
+static void CheckInternalGttReloption(List *options);
 static void truncate_check_perms(Oid relid, Form_pg_class reltuple);
 static void truncate_check_activity(Relation rel);
 static void RangeVarCallbackForTruncate(const RangeVar *relation,
@@ -787,6 +788,28 @@ static List *collectPartitionIndexExtDeps(List *partitionOids);
 static void applyPartitionIndexExtDeps(Oid newPartOid, List *extDepState);
 static void freePartitionIndexExtDeps(List *extDepState);
 
+/*
+ * CheckInternalGttReloption
+ *		Reject user-supplied settings of internal GTT reloptions.
+ *
+ * The on_commit_delete reloption is internal: it persists the ON COMMIT
+ * DELETE ROWS action for a global temporary table so other sessions can
+ * discover it.  Users must not set or reset it directly via CREATE TABLE
+ * ... WITH (...) or ALTER TABLE SET/RESET (...).
+ */
+static void
+CheckInternalGttReloption(List *options)
+{
+	foreach_node(DefElem, def, options)
+	{
+		if (strcmp(def->defname, "on_commit_delete") == 0)
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("on_commit_delete is an internal reloption and cannot be set directly"),
+					errhint("Use ON COMMIT DELETE ROWS when creating a global temporary table."));
+	}
+}
+
 /* ----------------------------------------------------------------
  *		DefineRelation
  *				Creates a new relation.
@@ -978,6 +1001,22 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	/* Identify user ID that will own the table */
 	if (!OidIsValid(ownerId))
 		ownerId = GetUserId();
+
+	/* Reject direct use of internal GTT reloptions */
+	CheckInternalGttReloption(stmt->options);
+
+	/*
+	 * For global temporary tables with ON COMMIT DELETE ROWS, persist the
+	 * on-commit action as a reloption so that other sessions can discover it.
+	 */
+	if (stmt->oncommit == ONCOMMIT_DELETE_ROWS
+		&& stmt->relation->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+	{
+		DefElem    *def = makeDefElem("on_commit_delete",
+									  (Node *) makeBoolean(true), -1);
+
+		stmt->options = lappend(stmt->options, def);
+	}
 
 	/*
 	 * Parse and validate reloptions, if any.
@@ -16984,6 +17023,9 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 
 	if (defList == NIL && operation != AT_ReplaceRelOptions)
 		return;					/* nothing to do */
+
+	/* Reject direct SET/RESET of internal GTT reloptions */
+	CheckInternalGttReloption(defList);
 
 	pgclass = table_open(RelationRelationId, RowExclusiveLock);
 

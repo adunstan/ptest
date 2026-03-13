@@ -19,5 +19,6 @@ extern void GttInitSessionStorage(Relation relation);
 extern void GttEnsureSessionStorage(Relation relation);
 extern bool GttHasSessionStorage(Oid relid);
 extern void GttScheduleDropSessionStorage(Oid relid);
+extern void PreCommit_gtt_on_commit(void);
 
 #endif							/* STORAGE_GTT_H */
