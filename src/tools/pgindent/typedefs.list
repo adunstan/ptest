@@ -1187,6 +1187,7 @@ GroupingSet
 GroupingSetData
 GroupingSetKind
 GroupingSetsPath
+GttStorageEntry
 GucAction
 GucBoolAssignHook
 GucBoolCheckHook

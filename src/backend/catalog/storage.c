@@ -135,8 +135,11 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 			needs_wal = false;
 			break;
 		case RELPERSISTENCE_UNLOGGED:
-		case RELPERSISTENCE_GLOBAL_TEMP:
 			procNumber = INVALID_PROC_NUMBER;
+			needs_wal = false;
+			break;
+		case RELPERSISTENCE_GLOBAL_TEMP:
+			procNumber = ProcNumberForTempRelations();
 			needs_wal = false;
 			break;
 		case RELPERSISTENCE_PERMANENT:

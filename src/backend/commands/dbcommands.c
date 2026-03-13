@@ -410,11 +410,14 @@ ScanSourceDatabasePgClassTuple(HeapTupleData *tuple, Oid tbid, Oid dbid,
 	 * are inaccessible outside of the session that created them, which must
 	 * be gone already, and couldn't connect to a different database if it
 	 * still existed. autovacuum will eventually remove the pg_class entries
-	 * as well.
+	 * as well.  Global temporary tables have no file at their catalog locator
+	 * (per-session storage is created lazily in each backend's temp
+	 * namespace), so there is nothing to copy for them either; their catalog
+	 * definitions travel with pg_class itself.
 	 */
 	if (classForm->reltablespace == GLOBALTABLESPACE_OID ||
 		!RELKIND_HAS_STORAGE(classForm->relkind) ||
-		classForm->relpersistence == RELPERSISTENCE_TEMP)
+		RELPERSISTENCE_IS_LOCAL(classForm->relpersistence))
 		return NULL;
 
 	/*

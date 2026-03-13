@@ -843,8 +843,7 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	 * Check consistency of arguments
 	 */
 	if (stmt->oncommit != ONCOMMIT_NOOP
-		&& stmt->relation->relpersistence != RELPERSISTENCE_TEMP
-		&& stmt->relation->relpersistence != RELPERSISTENCE_GLOBAL_TEMP)
+		&& !RELPERSISTENCE_IS_LOCAL(stmt->relation->relpersistence))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
 				 errmsg("ON COMMIT can only be used on temporary tables")));
@@ -2785,20 +2784,16 @@ MergeAttributes(List *columns, const List *supers, char relpersistence,
 		 * that inheritance allows that case.
 		 */
 		if (is_partition &&
-			relation->rd_rel->relpersistence != RELPERSISTENCE_TEMP &&
-			relation->rd_rel->relpersistence != RELPERSISTENCE_GLOBAL_TEMP &&
-			(relpersistence == RELPERSISTENCE_TEMP ||
-			 relpersistence == RELPERSISTENCE_GLOBAL_TEMP))
+			!RELPERSISTENCE_IS_LOCAL(relation->rd_rel->relpersistence) &&
+			RELPERSISTENCE_IS_LOCAL(relpersistence))
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("cannot create a temporary relation as partition of permanent relation \"%s\"",
 							RelationGetRelationName(relation))));
 
 		/* Permanent rels cannot inherit from temporary ones */
-		if (relpersistence != RELPERSISTENCE_TEMP &&
-			relpersistence != RELPERSISTENCE_GLOBAL_TEMP &&
-			(relation->rd_rel->relpersistence == RELPERSISTENCE_TEMP ||
-			 RelationIsGlobalTemp(relation)))
+		if (!RELPERSISTENCE_IS_LOCAL(relpersistence) &&
+			RELPERSISTENCE_IS_LOCAL(relation->rd_rel->relpersistence))
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg(!is_partition
@@ -20783,20 +20778,16 @@ ATExecAttachPartition(List **wqueue, Relation rel, PartitionCmd *cmd,
 						   RelationGetRelationName(attachrel))));
 
 	/* If the parent is permanent, so must be all of its partitions. */
-	if (rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP &&
-		rel->rd_rel->relpersistence != RELPERSISTENCE_GLOBAL_TEMP &&
-		(attachrel->rd_rel->relpersistence == RELPERSISTENCE_TEMP ||
-		 RelationIsGlobalTemp(attachrel)))
+	if (!RELPERSISTENCE_IS_LOCAL(rel->rd_rel->relpersistence) &&
+		RELPERSISTENCE_IS_LOCAL(attachrel->rd_rel->relpersistence))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("cannot attach a temporary relation as partition of permanent relation \"%s\"",
 						RelationGetRelationName(rel))));
 
 	/* Temp parent cannot have a partition that is itself not a temp */
-	if ((rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP ||
-		 RelationIsGlobalTemp(rel)) &&
-		attachrel->rd_rel->relpersistence != RELPERSISTENCE_TEMP &&
-		attachrel->rd_rel->relpersistence != RELPERSISTENCE_GLOBAL_TEMP)
+	if (RELPERSISTENCE_IS_LOCAL(rel->rd_rel->relpersistence) &&
+		!RELPERSISTENCE_IS_LOCAL(attachrel->rd_rel->relpersistence))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("cannot attach a permanent relation as partition of temporary relation \"%s\"",

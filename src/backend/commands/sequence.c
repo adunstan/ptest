@@ -48,6 +48,7 @@
 #include "utils/resowner.h"
 #include "utils/syscache.h"
 #include "utils/varlena.h"
+#include "catalog/storage_gtt.h"
 
 
 /*
@@ -330,6 +331,10 @@ ResetSequence(Oid seq_relid)
 static void
 fill_seq_with_data(Relation rel, HeapTuple tuple)
 {
+	/* a GTT sequence's per-session storage is created lazily */
+	if (rel->rd_rel->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+		GttEnsureSessionStorage(rel);
+
 	fill_seq_fork_with_data(rel, tuple, MAIN_FORKNUM);
 
 	if (rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED)
@@ -445,6 +450,14 @@ GttEnsureSequenceInitialized(Relation rel)
 
 	if (rel->rd_rel->relpersistence != RELPERSISTENCE_GLOBAL_TEMP)
 		return;
+
+	/*
+	 * Sequences are the documented exception to lazy storage creation: the
+	 * one-row contract (SELECT last_value FROM seq, psql's \d) requires a
+	 * readable row, so opening a GTT sequence materializes its one-page file
+	 * and seeds it.
+	 */
+	GttEnsureSessionStorage(rel);
 
 	if (RelationGetNumberOfBlocks(rel) > 0)
 		return;

@@ -64,6 +64,7 @@
 #include "catalog/pg_type.h"
 #include "catalog/schemapg.h"
 #include "catalog/storage.h"
+#include "catalog/storage_gtt.h"
 #include "commands/policy.h"
 #include "commands/publicationcmds.h"
 #include "commands/trigger.h"
@@ -1158,9 +1159,22 @@ retry:
 	{
 		case RELPERSISTENCE_UNLOGGED:
 		case RELPERSISTENCE_PERMANENT:
-		case RELPERSISTENCE_GLOBAL_TEMP:
 			relation->rd_backend = INVALID_PROC_NUMBER;
 			relation->rd_islocaltemp = false;
+			break;
+		case RELPERSISTENCE_GLOBAL_TEMP:
+
+			/*
+			 * GTT data is per-session: no other backend can see our rows.
+			 * Mark rd_islocaltemp so callers keyed off that flag (the
+			 * read-only-xact gate in COPY, extension-lock skips in hio.c and
+			 * the AM vacuum paths, etc.) treat GTTs consistently with regular
+			 * temp tables.  rd_backend is left INVALID_PROC_NUMBER here and
+			 * will be set to ProcNumberForTempRelations by
+			 * GttInitSessionStorage when physical-address init runs.
+			 */
+			relation->rd_backend = INVALID_PROC_NUMBER;
+			relation->rd_islocaltemp = true;
 			break;
 		case RELPERSISTENCE_TEMP:
 			if (isTempOrTempToastNamespace(relation->rd_rel->relnamespace))
@@ -1340,6 +1354,16 @@ RelationInitPhysicalAddr(Relation relation)
 	/* these relations kinds never have storage */
 	if (!RELKIND_HAS_STORAGE(relation->rd_rel->relkind))
 		return;
+
+	/*
+	 * Global temporary tables use per-session local storage.  Redirect the
+	 * relation's physical address to the session-local file.
+	 */
+	if (RelationIsGlobalTemp(relation))
+	{
+		GttInitSessionStorage(relation);
+		return;
+	}
 
 	if (relation->rd_rel->reltablespace)
 		relation->rd_locator.spcOid = relation->rd_rel->reltablespace;
@@ -3654,9 +3678,18 @@ RelationBuildLocalRelation(const char *relname,
 	{
 		case RELPERSISTENCE_UNLOGGED:
 		case RELPERSISTENCE_PERMANENT:
-		case RELPERSISTENCE_GLOBAL_TEMP:
 			rel->rd_backend = INVALID_PROC_NUMBER;
 			rel->rd_islocaltemp = false;
+			break;
+		case RELPERSISTENCE_GLOBAL_TEMP:
+
+			/*
+			 * As in RelationBuildDesc: GTT data is per-session, so mark
+			 * rd_islocaltemp; rd_backend is set by GttInitSessionStorage when
+			 * physical-address init runs.
+			 */
+			rel->rd_backend = INVALID_PROC_NUMBER;
+			rel->rd_islocaltemp = true;
 			break;
 		case RELPERSISTENCE_TEMP:
 			Assert(isTempOrTempToastNamespace(relnamespace));

@@ -28,7 +28,10 @@
 #include "access/reloptions.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "access/genam.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_class.h"
+#include "catalog/storage_gtt.h"
 #include "catalog/toasting.h"
 #include "commands/createas.h"
 #include "commands/matview.h"
@@ -302,6 +305,7 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 		List	   *rewritten;
 		PlannedStmt *plan;
 		QueryDesc  *queryDesc;
+		int			cursorOptions;
 
 		Assert(!is_matview);
 
@@ -319,9 +323,18 @@ ExecCreateTableAs(ParseState *pstate, CreateTableAsStmt *stmt,
 		query = linitial_node(Query, rewritten);
 		Assert(query->commandType == CMD_SELECT);
 
-		/* plan the query */
+		/*
+		 * Plan the query.  The inserting query may normally run in parallel,
+		 * but a global temporary table's per-session storage is created
+		 * lazily on the first write, which cannot happen in parallel mode.
+		 * The target relation is not in the query's range table, so
+		 * max_parallel_hazard() can't see it; suppress parallelism here.
+		 */
+		cursorOptions = CURSOR_OPT_PARALLEL_OK;
+		if (into->rel && into->rel->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+			cursorOptions = 0;
 		plan = pg_plan_query(query, pstate->p_sourcetext,
-							 CURSOR_OPT_PARALLEL_OK, params, NULL);
+							 cursorOptions, params, NULL);
 
 		/*
 		 * Use a snapshot with an updated command ID to ensure this query sees
@@ -531,6 +544,52 @@ intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 	 * Finally we can open the target table
 	 */
 	intoRelationDesc = table_open(intoRelationAddr.objectId, AccessExclusiveLock);
+
+	/*
+	 * For global temporary tables, pre-materialize the per-session storage
+	 * now, before the executor may enter parallel mode.  The SELECT variant
+	 * of CTAS already suppresses parallel planning via cursorOptions=0, but
+	 * the EXECUTE variant uses a pre-compiled plan that may have
+	 * parallelModeNeeded=true (e.g. under debug_parallel_query=regress).
+	 * GttEnsureSessionStorage would be called lazily on the first write, but
+	 * RelationCreateStorage asserts !IsInParallelMode(), so we force
+	 * materialization here while we are still outside parallel mode.
+	 *
+	 * We also pre-materialize the TOAST table (which inherits GTT persistence)
+	 * and trigger its deferred index build.  Without this, a CTAS producing
+	 * wide rows could fail when heap_insert opens the TOAST table and calls
+	 * GttEnsureSessionStorage in the middle of parallel execution.
+	 */
+	if (!into->skipData && RelationIsGlobalTemp(intoRelationDesc))
+	{
+		GttEnsureSessionStorage(intoRelationDesc);
+		if (OidIsValid(intoRelationDesc->rd_rel->reltoastrelid))
+		{
+			Relation	toastrel;
+			List	   *indexlist;
+			ListCell   *ilc;
+
+			toastrel = table_open(intoRelationDesc->rd_rel->reltoastrelid,
+								  AccessShareLock);
+			GttEnsureSessionStorage(toastrel);
+
+			/*
+			 * Opening each TOAST index triggers GttBuildIndexIfNeeded, which
+			 * will find the TOAST heap storage materialized and build_deferred
+			 * set (set during create_ctas_internal because the heap was then
+			 * empty), and so will materialize and initialize the index.
+			 */
+			indexlist = RelationGetIndexList(toastrel);
+			foreach(ilc, indexlist)
+			{
+				Relation	idxrel = index_open(lfirst_oid(ilc), AccessShareLock);
+
+				index_close(idxrel, AccessShareLock);
+			}
+			list_free(indexlist);
+			table_close(toastrel, AccessShareLock);
+		}
+	}
 
 	/*
 	 * Make sure the constructed table does not have RLS enabled.

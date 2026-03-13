@@ -44,6 +44,7 @@
 #include "catalog/pg_tablespace_d.h"
 #endif
 #include "catalog/storage.h"
+#include "catalog/storage_gtt.h"
 #include "catalog/storage_xlog.h"
 #include "common/hashfn.h"
 #include "executor/instrument.h"
@@ -1246,7 +1247,7 @@ PinBufferForBlock(Relation rel,
 									   smgr->smgr_rlocator.locator.relNumber,
 									   smgr->smgr_rlocator.backend);
 
-	if (persistence == RELPERSISTENCE_TEMP)
+	if (RELPERSISTENCE_IS_LOCAL(persistence))
 		bufHdr = LocalBufferAlloc(smgr, forkNum, blockNum, foundPtr);
 	else
 		bufHdr = BufferAlloc(smgr, persistence, forkNum, blockNum,
@@ -1328,7 +1329,7 @@ ReadBuffer_common(Relation rel, SMgrRelation smgr, char smgr_persistence,
 		IOContext	io_context;
 		IOObject	io_object;
 
-		if (persistence == RELPERSISTENCE_TEMP)
+		if (RELPERSISTENCE_IS_LOCAL(persistence))
 		{
 			io_context = IOCONTEXT_NORMAL;
 			io_object = IOOBJECT_TEMP_RELATION;
@@ -1392,7 +1393,7 @@ StartReadBuffersImpl(ReadBuffersOperation *operation,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot access temporary tables of other sessions")));
 
-	if (operation->persistence == RELPERSISTENCE_TEMP)
+	if (RELPERSISTENCE_IS_LOCAL(operation->persistence))
 	{
 		io_context = IOCONTEXT_NORMAL;
 		io_object = IOOBJECT_TEMP_RELATION;
@@ -1693,7 +1694,7 @@ TrackBufferHit(IOObject io_object, IOContext io_context,
 									  smgr->smgr_rlocator.backend,
 									  true);
 
-	if (persistence == RELPERSISTENCE_TEMP)
+	if (RELPERSISTENCE_IS_LOCAL(persistence))
 		pgBufferUsage.local_blks_hit += 1;
 	else
 		pgBufferUsage.shared_blks_hit += 1;
@@ -1764,7 +1765,7 @@ WaitReadBuffers(ReadBuffersOperation *operation)
 	IOObject	io_object;
 	bool		needed_wait = false;
 
-	if (operation->persistence == RELPERSISTENCE_TEMP)
+	if (RELPERSISTENCE_IS_LOCAL(operation->persistence))
 	{
 		io_context = IOCONTEXT_NORMAL;
 		io_object = IOOBJECT_TEMP_RELATION;
@@ -1954,7 +1955,7 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
 	instr_time	io_start;
 	StartBufferIOResult status;
 
-	if (persistence == RELPERSISTENCE_TEMP)
+	if (RELPERSISTENCE_IS_LOCAL(persistence))
 	{
 		io_context = IOCONTEXT_NORMAL;
 		io_object = IOOBJECT_TEMP_RELATION;
@@ -1973,7 +1974,7 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
 	if (flags & READ_BUFFERS_SYNCHRONOUSLY)
 		ioh_flags |= PGAIO_HF_SYNCHRONOUS;
 
-	if (persistence == RELPERSISTENCE_TEMP)
+	if (RELPERSISTENCE_IS_LOCAL(persistence))
 		ioh_flags |= PGAIO_HF_REFERENCES_LOCAL;
 
 	/*
@@ -2134,7 +2135,7 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
 	pgaio_io_set_handle_data_32(ioh, (uint32 *) io_buffers, io_buffers_len);
 
 	pgaio_io_register_callbacks(ioh,
-								persistence == RELPERSISTENCE_TEMP ?
+								RELPERSISTENCE_IS_LOCAL(persistence) ?
 								PGAIO_HCB_LOCAL_BUFFER_READV :
 								PGAIO_HCB_SHARED_BUFFER_READV,
 								flags);
@@ -2157,7 +2158,7 @@ AsyncReadBuffers(ReadBuffersOperation *operation, int *nblocks_progress)
 	pgstat_count_io_op_time(io_object, io_context, IOOP_READ,
 							io_start, 1, io_buffers_len * BLCKSZ);
 
-	if (persistence == RELPERSISTENCE_TEMP)
+	if (RELPERSISTENCE_IS_LOCAL(persistence))
 		pgBufferUsage.local_blks_read += io_buffers_len;
 	else
 		pgBufferUsage.shared_blks_read += io_buffers_len;
@@ -2767,7 +2768,7 @@ ExtendBufferedRelCommon(BufferManagerRelation bmr,
 										 BMR_GET_SMGR(bmr)->smgr_rlocator.backend,
 										 extend_by);
 
-	if (bmr.relpersistence == RELPERSISTENCE_TEMP)
+	if (RELPERSISTENCE_IS_LOCAL(bmr.relpersistence))
 		first_block = ExtendBufferedRelLocal(bmr, fork, flags,
 											 extend_by, extend_upto,
 											 buffers, &extend_by);
@@ -4654,6 +4655,16 @@ FlushUnlockedBuffer(BufferDesc *buf, SMgrRelation reln,
 BlockNumber
 RelationGetNumberOfBlocksInFork(Relation relation, ForkNumber forkNum)
 {
+	/*
+	 * A global temporary table whose per-session storage has not been
+	 * materialized has no file: it is empty by definition.  Reporting zero
+	 * blocks here (and in table_block_relation_size) is what lets reads of
+	 * never-written GTTs complete without creating any storage.
+	 */
+	if (RelationIsGlobalTemp(relation) &&
+		!GttHasSessionStorage(RelationGetRelid(relation)))
+		return 0;
+
 	if (RELKIND_HAS_TABLE_AM(relation->rd_rel->relkind))
 	{
 		/*

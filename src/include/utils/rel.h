@@ -651,13 +651,10 @@ RelationCloseSmgr(Relation relation)
 /*
  * RelationUsesLocalBuffers
  *		True if relation's pages are stored in local buffers.
- *
- * Note: global temporary tables will use local buffers for per-session
- * data storage once that infrastructure is implemented.  For now, their
- * shared catalog storage uses shared buffers like permanent tables.
  */
 #define RelationUsesLocalBuffers(relation) \
-	((relation)->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+	((relation)->rd_rel->relpersistence == RELPERSISTENCE_TEMP || \
+	 (relation)->rd_rel->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
 
 /*
  * RELATION_IS_LOCAL

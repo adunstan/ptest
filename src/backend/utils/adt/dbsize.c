@@ -19,6 +19,7 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_tablespace.h"
+#include "catalog/storage_gtt.h"
 #include "commands/tablespace.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
@@ -1020,8 +1021,23 @@ pg_relation_filepath(PG_FUNCTION_ARGS)
 	{
 		case RELPERSISTENCE_UNLOGGED:
 		case RELPERSISTENCE_PERMANENT:
-		case RELPERSISTENCE_GLOBAL_TEMP:
 			backend = INVALID_PROC_NUMBER;
+			break;
+		case RELPERSISTENCE_GLOBAL_TEMP:
+
+			/*
+			 * GTTs have no shared storage; each backend has a private file
+			 * named after its own proc number.  If the current session has
+			 * initialized this GTT, report that file; otherwise NULL,
+			 * matching the "not yet accessed" state.
+			 */
+			if (GttHasSessionStorage(relid))
+				backend = ProcNumberForTempRelations();
+			else
+			{
+				ReleaseSysCache(tuple);
+				PG_RETURN_NULL();
+			}
 			break;
 		case RELPERSISTENCE_TEMP:
 			if (isTempOrTempToastNamespace(relform->relnamespace))

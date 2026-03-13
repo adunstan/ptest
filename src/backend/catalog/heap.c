@@ -54,6 +54,7 @@
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
 #include "catalog/storage.h"
+#include "catalog/storage_gtt.h"
 #include "commands/tablecmds.h"
 #include "commands/typecmds.h"
 #include "common/int.h"
@@ -344,6 +345,14 @@ heap_create(const char *relname,
 		 */
 		if (!RelFileNumberIsValid(relfilenumber))
 			relfilenumber = relid;
+
+		/*
+		 * Global temporary tables need a relfilenode in the catalog (used as
+		 * the basis for per-session file naming), but don't create shared
+		 * storage -- per-session storage is created lazily.
+		 */
+		if (relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+			create_storage = false;
 	}
 
 	/*
@@ -1900,6 +1909,15 @@ heap_drop_with_catalog(Oid relid)
 	 */
 	if (RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
 		RelationDropStorage(rel);
+
+	/*
+	 * For global temporary tables, also schedule release of the per-session
+	 * hash entry and the session-level lock.  Physical file unlinking goes
+	 * through the normal PendingRelDelete path above (rd_locator has been
+	 * redirected to the per-session locator).
+	 */
+	if (RelationIsGlobalTemp(rel))
+		GttScheduleDropSessionStorage(relid);
 
 	/* ensure that stats are dropped if transaction commits */
 	pgstat_drop_relation(rel);

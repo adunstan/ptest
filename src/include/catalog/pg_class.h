@@ -185,6 +185,14 @@ MAKE_SYSCACHE(RELNAMENSP, pg_class_relname_nsp_index, 128);
 #define		  RELPERSISTENCE_TEMP		't' /* temporary table */
 #define		  RELPERSISTENCE_GLOBAL_TEMP 'g'	/* global temporary table */
 
+/*
+ * Does this persistence type use local (per-backend) buffers?
+ * Both session-local temp tables and global temporary tables store
+ * their data in local buffers.
+ */
+#define RELPERSISTENCE_IS_LOCAL(p) \
+	((p) == RELPERSISTENCE_TEMP || (p) == RELPERSISTENCE_GLOBAL_TEMP)
+
 /* default selection for replica identity (primary key or nothing) */
 #define		  REPLICA_IDENTITY_DEFAULT	'd'
 /* no replica identity is logged for this relation */
