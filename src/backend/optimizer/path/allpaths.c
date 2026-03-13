@@ -664,16 +664,22 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
 
 			/*
 			 * Currently, parallel workers can't access the leader's temporary
-			 * tables.  We could possibly relax this if we wrote all of its
-			 * local buffers at the start of the query and made no changes
-			 * thereafter (maybe we could allow hint bit changes), and if we
-			 * taught the workers to read them.  Writing a large number of
-			 * temporary buffers could be expensive, though, and we don't have
-			 * the rest of the necessary infrastructure right now anyway.  So
-			 * for now, bail out if we see a temporary table.
+			 * tables, nor a global temporary table's per-session data.  We
+			 * could possibly relax this if we wrote all of its local buffers
+			 * at the start of the query and made no changes thereafter (maybe
+			 * we could allow hint bit changes), and if we taught the workers
+			 * to read them.  Writing a large number of temporary buffers
+			 * could be expensive, though, and we don't have the rest of the
+			 * necessary infrastructure right now anyway.  So for now, bail
+			 * out if we see a temporary or global temporary table.
 			 */
-			if (get_rel_persistence(rte->relid) == RELPERSISTENCE_TEMP)
-				return;
+			{
+				char		relpersist = get_rel_persistence(rte->relid);
+
+				if (relpersist == RELPERSISTENCE_TEMP ||
+					relpersist == RELPERSISTENCE_GLOBAL_TEMP)
+					return;
+			}
 
 			/*
 			 * Table sampling can be pushed down to workers if the sample

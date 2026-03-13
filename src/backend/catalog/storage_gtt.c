@@ -22,6 +22,7 @@
 #include "postgres.h"
 
 #include "access/amapi.h"
+#include "access/parallel.h"
 #include "access/relation.h"
 #include "access/table.h"
 #include "access/tableam.h"
@@ -184,6 +185,33 @@ GttInitSessionStorage(Relation relation)
 	bool		found;
 	Oid			relid = RelationGetRelid(relation);
 
+	/*
+	 * A parallel worker must never create or register per-session storage:
+	 * the storage map is backend-local (a worker cannot see the leader's
+	 * entries or dirty local buffers), so any worker-side materialization
+	 * would corrupt or duplicate the leader's session state.  But a worker
+	 * may legitimately need only the relation's catalog metadata -- e.g.
+	 * pg_get_expr() opens the relation to deparse a column default while
+	 * pg_dump runs under debug_parallel_query.  Point the relcache entry at
+	 * the session-local file in the leader's temp namespace, exactly as an
+	 * untouched GTT looks in the leader, but without recording anything in
+	 * the storage map.  No file is created here; if the leader never
+	 * materialized the relation, reads short-circuit to empty.  The planner
+	 * never makes a GTT a parallel baserel and DML is never parallelized, so
+	 * a worker never actually scans or writes one.
+	 */
+	if (IsParallelWorker())
+	{
+		if (OidIsValid(relation->rd_rel->reltablespace))
+			relation->rd_locator.spcOid = relation->rd_rel->reltablespace;
+		else
+			relation->rd_locator.spcOid = MyDatabaseTableSpace;
+		relation->rd_locator.dbOid = MyDatabaseId;
+		relation->rd_locator.relNumber = relation->rd_rel->relfilenode;
+		relation->rd_backend = ProcNumberForTempRelations();
+		return;
+	}
+
 	ensure_gtt_hash();
 
 	entry = (GttStorageEntry *) hash_search(gtt_storage_hash,
@@ -338,6 +366,17 @@ GttEnsureSessionStorage(Relation relation)
 
 	if (entry->storage_created)
 		return;
+
+	/*
+	 * RelationCreateStorage cannot run in parallel mode (it couldn't update
+	 * pendingSyncHash), and a worker must never materialize state in the
+	 * leader's temp namespace; relcache builds in workers are already
+	 * rejected in GttInitSessionStorage.
+	 */
+	if (IsInParallelMode())
+		ereport(ERROR,
+				errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				errmsg("cannot initialize global temporary table storage during a parallel operation"));
 
 	RelationCreateStorage(entry->locator, RELPERSISTENCE_GLOBAL_TEMP, true);
 	entry->storage_created = true;

@@ -2073,6 +2073,13 @@ do_autovacuum(void)
 			continue;
 		}
 
+		/*
+		 * Global temporary tables have per-session local storage that
+		 * autovacuum cannot access.  Skip them.
+		 */
+		if (classForm->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+			continue;
+
 		/* Fetch reloptions and the pgstat entry for this table */
 		relopts = extract_autovac_opts(tuple, pg_class_desc);
 
@@ -2147,9 +2154,11 @@ do_autovacuum(void)
 		AutoVacuumScores scores;
 
 		/*
-		 * We cannot safely process other backends' temp tables, so skip 'em.
+		 * We cannot safely process other backends' temp tables or GTTs (which
+		 * have per-session local storage), so skip them.
 		 */
-		if (classForm->relpersistence == RELPERSISTENCE_TEMP)
+		if (classForm->relpersistence == RELPERSISTENCE_TEMP ||
+			classForm->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
 			continue;
 
 		relid = classForm->oid;
