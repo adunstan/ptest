@@ -1237,7 +1237,8 @@ PinBufferForBlock(Relation rel,
 	/* Persistence should be set before */
 	Assert((persistence == RELPERSISTENCE_TEMP ||
 			persistence == RELPERSISTENCE_PERMANENT ||
-			persistence == RELPERSISTENCE_UNLOGGED));
+			persistence == RELPERSISTENCE_UNLOGGED ||
+			persistence == RELPERSISTENCE_GLOBAL_TEMP));
 
 	TRACE_POSTGRESQL_BUFFER_READ_START(forkNum, blockNum,
 									   smgr->smgr_rlocator.locator.spcOid,

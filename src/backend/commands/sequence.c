@@ -421,6 +421,56 @@ fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum)
 }
 
 /*
+ * GttEnsureSequenceInitialized
+ *		Seed per-session storage for a global temporary sequence.
+ *
+ * A GTT sequence's catalog row is shared across sessions, but each session
+ * has its own physical storage (allocated lazily by GttInitSessionStorage).
+ * That storage starts out empty — block 0 does not exist — so any attempt
+ * to read the sequence tuple would fail.  Called from relation_open for
+ * every GTT sequence, so even a direct heapscan of the sequence (SELECT
+ * last_value FROM seq, as psql's \d emits) sees the one mandatory row.
+ * The first open in each session writes block 0, using the definition
+ * recorded in pg_sequence as the initial state (last_value = seqstart,
+ * log_cnt = 0, is_called = false).
+ */
+void
+GttEnsureSequenceInitialized(Relation rel)
+{
+	HeapTuple	pgstuple;
+	Form_pg_sequence pgsform;
+	Datum		value[SEQ_COL_LASTCOL];
+	bool		null[SEQ_COL_LASTCOL] = {0};
+	HeapTuple	tuple;
+
+	if (rel->rd_rel->relpersistence != RELPERSISTENCE_GLOBAL_TEMP)
+		return;
+
+	if (RelationGetNumberOfBlocks(rel) > 0)
+		return;
+
+	/*
+	 * No pg_sequence row yet: we are inside CREATE SEQUENCE, opened from
+	 * DefineSequence before the row is inserted.  The creator fills the
+	 * initial tuple itself via fill_seq_with_data.
+	 */
+	pgstuple = SearchSysCache1(SEQRELID, ObjectIdGetDatum(RelationGetRelid(rel)));
+	if (!HeapTupleIsValid(pgstuple))
+		return;
+	pgsform = (Form_pg_sequence) GETSTRUCT(pgstuple);
+
+	value[SEQ_COL_LASTVAL - 1] = Int64GetDatumFast(pgsform->seqstart);
+	value[SEQ_COL_LOG - 1] = Int64GetDatum((int64) 0);
+	value[SEQ_COL_CALLED - 1] = BoolGetDatum(false);
+
+	ReleaseSysCache(pgstuple);
+
+	tuple = heap_form_tuple(RelationGetDescr(rel), value, null);
+	fill_seq_fork_with_data(rel, tuple, MAIN_FORKNUM);
+	heap_freetuple(tuple);
+}
+
+/*
  * AlterSequence
  *
  * Modify the definition of a sequence relation
@@ -1815,12 +1865,14 @@ pg_get_sequence_data(PG_FUNCTION_ARGS)
 
 	/*
 	 * Return all NULLs for missing sequences, sequences for which we lack
-	 * privileges, other sessions' temporary sequences, and unlogged sequences
-	 * on standbys.
+	 * privileges, other sessions' temporary sequences, global temporary
+	 * sequences (their data is per-session and not meaningful across backends
+	 * or in a dump), and unlogged sequences on standbys.
 	 */
 	if (seqrel && seqrel->rd_rel->relkind == RELKIND_SEQUENCE &&
 		pg_class_aclcheck(relid, GetUserId(), ACL_SELECT) == ACLCHECK_OK &&
 		!RELATION_IS_OTHER_TEMP(seqrel) &&
+		seqrel->rd_rel->relpersistence != RELPERSISTENCE_GLOBAL_TEMP &&
 		(RelationIsPermanent(seqrel) || !RecoveryInProgress()))
 	{
 		Buffer		buf;

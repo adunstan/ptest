@@ -23,11 +23,29 @@
 #include "access/relation.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "commands/sequence.h"
 #include "pgstat.h"
 #include "storage/lmgr.h"
 #include "storage/lock.h"
 #include "utils/inval.h"
 #include "utils/syscache.h"
+
+static void relation_open_gtt_prepare(Relation r);
+
+/*
+ * relation_open_gtt_prepare
+ *		Lazily materialize the session-local pieces of a global temporary
+ *		relation that need more than bare storage: sequences must be seeded
+ *		with their initial tuple.  Doing this here, at the single chokepoint
+ *		every open funnels through, covers direct relation_open callers
+ *		(executor scans of a sequence) as well as the sequence functions.
+ */
+static void
+relation_open_gtt_prepare(Relation r)
+{
+	if (r->rd_rel->relkind == RELKIND_SEQUENCE)
+		GttEnsureSequenceInitialized(r);
+}
 
 
 /* ----------------
@@ -72,6 +90,9 @@ relation_open(Oid relationId, LOCKMODE lockmode)
 	/* Make note that we've accessed a temporary relation */
 	if (RelationUsesLocalBuffers(r))
 		MyXactFlags |= XACT_FLAGS_ACCESSEDTEMPNAMESPACE;
+
+	if (RelationIsGlobalTemp(r))
+		relation_open_gtt_prepare(r);
 
 	pgstat_init_relation(r);
 
@@ -122,6 +143,9 @@ try_relation_open(Oid relationId, LOCKMODE lockmode)
 	/* Make note that we've accessed a temporary relation */
 	if (RelationUsesLocalBuffers(r))
 		MyXactFlags |= XACT_FLAGS_ACCESSEDTEMPNAMESPACE;
+
+	if (RelationIsGlobalTemp(r))
+		relation_open_gtt_prepare(r);
 
 	pgstat_init_relation(r);
 

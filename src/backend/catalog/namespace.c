@@ -869,6 +869,21 @@ RangeVarAdjustRelationPersistence(RangeVar *newRelation, Oid nspid)
 						(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
 						 errmsg("cannot create relations in temporary schemas of other sessions")));
 			break;
+		case RELPERSISTENCE_GLOBAL_TEMP:
+
+			/*
+			 * A global temporary table is a permanent catalog object that
+			 * merely carries per-session data, so it has no business living
+			 * in a temporary schema.  Reject it explicitly rather than
+			 * letting it fall through to the generic message below, which
+			 * would wrongly imply a global temporary table is not a temporary
+			 * relation.
+			 */
+			if (isAnyTempNamespace(nspid))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+						 errmsg("cannot create a global temporary table in a temporary schema")));
+			break;
 		default:
 			if (isAnyTempNamespace(nspid))
 				ereport(ERROR,

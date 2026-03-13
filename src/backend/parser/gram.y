@@ -3913,31 +3913,17 @@ CreateStmt:	CREATE OptTemp TABLE qualified_name '(' OptTableElementList ')'
  * Redundancy here is needed to avoid shift/reduce conflicts,
  * since TEMP is not a reserved word.  See also OptTempTableName.
  *
- * NOTE: we accept both GLOBAL and LOCAL options.  They currently do nothing,
- * but future versions might consider GLOBAL to request SQL-spec-compliant
- * temp table behavior, so warn about that.  Since we have no modules the
- * LOCAL keyword is really meaningless; furthermore, some other products
- * implement LOCAL as meaning the same as our default temp table behavior,
- * so we'll probably continue to treat LOCAL as a noise word.
+ * NOTE: GLOBAL creates a SQL-standard global temporary table, visible to
+ * all sessions but with per-session data.  LOCAL is treated as equivalent
+ * to plain TEMPORARY (session-local), as most other products implement it;
+ * since we have no module-level scope, LOCAL remains a noise word.
  */
 OptTemp:	TEMPORARY					{ $$ = RELPERSISTENCE_TEMP; }
 			| TEMP						{ $$ = RELPERSISTENCE_TEMP; }
 			| LOCAL TEMPORARY			{ $$ = RELPERSISTENCE_TEMP; }
 			| LOCAL TEMP				{ $$ = RELPERSISTENCE_TEMP; }
-			| GLOBAL TEMPORARY
-				{
-					ereport(WARNING,
-							(errmsg("GLOBAL is deprecated in temporary table creation"),
-							 parser_errposition(@1)));
-					$$ = RELPERSISTENCE_TEMP;
-				}
-			| GLOBAL TEMP
-				{
-					ereport(WARNING,
-							(errmsg("GLOBAL is deprecated in temporary table creation"),
-							 parser_errposition(@1)));
-					$$ = RELPERSISTENCE_TEMP;
-				}
+			| GLOBAL TEMPORARY			{ $$ = RELPERSISTENCE_GLOBAL_TEMP; }
+			| GLOBAL TEMP				{ $$ = RELPERSISTENCE_GLOBAL_TEMP; }
 			| UNLOGGED					{ $$ = RELPERSISTENCE_UNLOGGED; }
 			| /*EMPTY*/					{ $$ = RELPERSISTENCE_PERMANENT; }
 		;
@@ -13972,19 +13958,13 @@ OptTempTableName:
 				}
 			| GLOBAL TEMPORARY opt_table qualified_name
 				{
-					ereport(WARNING,
-							(errmsg("GLOBAL is deprecated in temporary table creation"),
-							 parser_errposition(@1)));
 					$$ = $4;
-					$$->relpersistence = RELPERSISTENCE_TEMP;
+					$$->relpersistence = RELPERSISTENCE_GLOBAL_TEMP;
 				}
 			| GLOBAL TEMP opt_table qualified_name
 				{
-					ereport(WARNING,
-							(errmsg("GLOBAL is deprecated in temporary table creation"),
-							 parser_errposition(@1)));
 					$$ = $4;
-					$$->relpersistence = RELPERSISTENCE_TEMP;
+					$$->relpersistence = RELPERSISTENCE_GLOBAL_TEMP;
 				}
 			| UNLOGGED opt_table qualified_name
 				{

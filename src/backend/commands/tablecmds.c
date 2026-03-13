@@ -843,10 +843,17 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	 * Check consistency of arguments
 	 */
 	if (stmt->oncommit != ONCOMMIT_NOOP
-		&& stmt->relation->relpersistence != RELPERSISTENCE_TEMP)
+		&& stmt->relation->relpersistence != RELPERSISTENCE_TEMP
+		&& stmt->relation->relpersistence != RELPERSISTENCE_GLOBAL_TEMP)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
 				 errmsg("ON COMMIT can only be used on temporary tables")));
+
+	if (stmt->oncommit == ONCOMMIT_DROP
+		&& stmt->relation->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+		ereport(ERROR,
+				errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				errmsg("ON COMMIT DROP is not supported for global temporary tables"));
 
 	if (stmt->partspec != NULL)
 	{
@@ -1094,6 +1101,23 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		if (RELKIND_HAS_TABLE_AM(relkind) && !OidIsValid(accessMethodId))
 			accessMethodId = get_table_am_oid(default_table_access_method, false);
 	}
+
+	/*
+	 * Global temporary tables rely on the heap table access method.  Their
+	 * per-session storage, local buffering, and tuple visibility handling are
+	 * all heap-specific (see storage_gtt.c), and the wraparound-safety
+	 * reasoning for GTTs assumes heap.  Reject any other access method --
+	 * whether requested with USING or inherited from
+	 * default_table_access_method -- rather than create a table that cannot
+	 * work correctly.
+	 */
+	if (stmt->relation->relpersistence == RELPERSISTENCE_GLOBAL_TEMP &&
+		OidIsValid(accessMethodId) &&
+		accessMethodId != HEAP_TABLE_AM_OID)
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("access method \"%s\" is not supported for global temporary tables",
+					   get_am_name(accessMethodId)));
 
 	/*
 	 * Create the relation.  Inherited defaults and CHECK constraints are
@@ -2762,7 +2786,9 @@ MergeAttributes(List *columns, const List *supers, char relpersistence,
 		 */
 		if (is_partition &&
 			relation->rd_rel->relpersistence != RELPERSISTENCE_TEMP &&
-			relpersistence == RELPERSISTENCE_TEMP)
+			relation->rd_rel->relpersistence != RELPERSISTENCE_GLOBAL_TEMP &&
+			(relpersistence == RELPERSISTENCE_TEMP ||
+			 relpersistence == RELPERSISTENCE_GLOBAL_TEMP))
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("cannot create a temporary relation as partition of permanent relation \"%s\"",
@@ -2770,13 +2796,28 @@ MergeAttributes(List *columns, const List *supers, char relpersistence,
 
 		/* Permanent rels cannot inherit from temporary ones */
 		if (relpersistence != RELPERSISTENCE_TEMP &&
-			relation->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+			relpersistence != RELPERSISTENCE_GLOBAL_TEMP &&
+			(relation->rd_rel->relpersistence == RELPERSISTENCE_TEMP ||
+			 RelationIsGlobalTemp(relation)))
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg(!is_partition
 							? "cannot inherit from temporary relation \"%s\""
 							: "cannot create a permanent relation as partition of temporary relation \"%s\"",
 							RelationGetRelationName(relation))));
+
+		/*
+		 * Don't allow mixing global temporary tables with local temporary
+		 * tables in inheritance or partitioning hierarchies, in either
+		 * direction.
+		 */
+		if ((relpersistence == RELPERSISTENCE_GLOBAL_TEMP &&
+			 relation->rd_rel->relpersistence == RELPERSISTENCE_TEMP) ||
+			(relpersistence == RELPERSISTENCE_TEMP &&
+			 RelationIsGlobalTemp(relation)))
+			ereport(ERROR,
+					errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					errmsg("cannot mix global temporary and local temporary tables in inheritance"));
 
 		/* If existing rel is temp, it must belong to this session */
 		if (RELATION_IS_OTHER_TEMP(relation))
@@ -6004,6 +6045,21 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("cannot rewrite temporary tables of other sessions")));
+
+			/*
+			 * A table rewrite rotates the catalog relfilenode.  For a GTT,
+			 * every session's per-session storage is keyed by the catalog
+			 * relfilenode, so rotating it would leave other sessions pointing
+			 * at files that no longer exist or at the wrong generation of the
+			 * table.  Block rewrites for GTTs along with the other
+			 * relfilenode-rotating commands (CLUSTER / REINDEX / SET
+			 * TABLESPACE / SET LOGGED|UNLOGGED).
+			 */
+			if (RelationIsGlobalTemp(OldHeap))
+				ereport(ERROR,
+						errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot rewrite global temporary table \"%s\"",
+							   RelationGetRelationName(OldHeap)));
 
 			/*
 			 * Select destination tablespace (same as original unless user
@@ -10234,6 +10290,12 @@ ATAddForeignKeyConstraint(List **wqueue, AlteredTableInfo *tab, Relation rel,
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
 						 errmsg("constraints on temporary tables must involve temporary tables of this session")));
+			break;
+		case RELPERSISTENCE_GLOBAL_TEMP:
+			if (pkrel->rd_rel->relpersistence != RELPERSISTENCE_GLOBAL_TEMP)
+				ereport(ERROR,
+						errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+						errmsg("constraints on global temporary tables may reference only global temporary tables"));
 			break;
 	}
 
@@ -16873,6 +16935,18 @@ ATPrepSetTableSpace(AlteredTableInfo *tab, Relation rel, const char *tablespacen
 {
 	Oid			tablespaceId;
 
+	/*
+	 * SET TABLESPACE rewrites the file and assigns a new relfilenode.  For
+	 * GTTs the catalog relfilenode is the stem of every session's local file
+	 * name, so rotating it would desynchronize all other sessions'
+	 * per-session storage mappings.
+	 */
+	if (RelationIsGlobalTemp(rel))
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("cannot change tablespace of global temporary table \"%s\"",
+					   RelationGetRelationName(rel)));
+
 	/* Check that the tablespace exists */
 	tablespaceId = get_tablespace_oid(tablespacename, false);
 
@@ -17537,6 +17611,23 @@ ATExecAddInherit(Relation child_rel, RangeVar *parent, LOCKMODE lockmode)
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("cannot inherit from temporary relation \"%s\"",
 						RelationGetRelationName(parent_rel))));
+
+	/*
+	 * GTTs mix neither with permanent nor with local temporary relations. See
+	 * MergeAttributes() for the CREATE TABLE side of this rule.
+	 */
+	if (RelationIsGlobalTemp(parent_rel) &&
+		child_rel->rd_rel->relpersistence != RELPERSISTENCE_GLOBAL_TEMP)
+		ereport(ERROR,
+				errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				errmsg("cannot inherit from global temporary relation \"%s\"",
+					   RelationGetRelationName(parent_rel)));
+	if (parent_rel->rd_rel->relpersistence != RELPERSISTENCE_GLOBAL_TEMP &&
+		RelationIsGlobalTemp(child_rel))
+		ereport(ERROR,
+				errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				errmsg("cannot inherit into global temporary relation \"%s\"",
+					   RelationGetRelationName(child_rel)));
 
 	/* If parent rel is temp, it must belong to this session */
 	if (RELATION_IS_OTHER_TEMP(parent_rel))
@@ -19086,6 +19177,13 @@ ATPrepChangePersistence(AlteredTableInfo *tab, Relation rel, bool toLogged)
 					 errmsg("cannot change logged status of table \"%s\" because it is temporary",
 							RelationGetRelationName(rel)),
 					 errtable(rel)));
+			break;
+		case RELPERSISTENCE_GLOBAL_TEMP:
+			ereport(ERROR,
+					errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+					errmsg("cannot change logged status of table \"%s\" because it is a global temporary table",
+						   RelationGetRelationName(rel)),
+					errtable(rel));
 			break;
 		case RELPERSISTENCE_PERMANENT:
 			if (toLogged)
@@ -20686,19 +20784,37 @@ ATExecAttachPartition(List **wqueue, Relation rel, PartitionCmd *cmd,
 
 	/* If the parent is permanent, so must be all of its partitions. */
 	if (rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP &&
-		attachrel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+		rel->rd_rel->relpersistence != RELPERSISTENCE_GLOBAL_TEMP &&
+		(attachrel->rd_rel->relpersistence == RELPERSISTENCE_TEMP ||
+		 RelationIsGlobalTemp(attachrel)))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("cannot attach a temporary relation as partition of permanent relation \"%s\"",
 						RelationGetRelationName(rel))));
 
 	/* Temp parent cannot have a partition that is itself not a temp */
-	if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP &&
-		attachrel->rd_rel->relpersistence != RELPERSISTENCE_TEMP)
+	if ((rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP ||
+		 RelationIsGlobalTemp(rel)) &&
+		attachrel->rd_rel->relpersistence != RELPERSISTENCE_TEMP &&
+		attachrel->rd_rel->relpersistence != RELPERSISTENCE_GLOBAL_TEMP)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("cannot attach a permanent relation as partition of temporary relation \"%s\"",
 						RelationGetRelationName(rel))));
+
+	/* GTT and local-temp cannot mix as partition parent/child */
+	if (RelationIsGlobalTemp(rel) &&
+		attachrel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+		ereport(ERROR,
+				errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				errmsg("cannot attach a local temporary relation as partition of global temporary relation \"%s\"",
+					   RelationGetRelationName(rel)));
+	if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP &&
+		RelationIsGlobalTemp(attachrel))
+		ereport(ERROR,
+				errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				errmsg("cannot attach a global temporary relation as partition of local temporary relation \"%s\"",
+					   RelationGetRelationName(rel)));
 
 	/* If the parent is temp, it must belong to this session */
 	if (RELATION_IS_OTHER_TEMP(rel))
@@ -22784,6 +22900,20 @@ createPartitionTable(List **wqueue, RangeVar *newPartName,
 		ereport(ERROR,
 				errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				errmsg("cannot create a permanent relation as partition of temporary relation \"%s\"",
+					   RelationGetRelationName(parent_rel)));
+
+	/*
+	 * Splitting or merging partitions of a global temporary table is not
+	 * supported.  The new partition created here would not inherit the
+	 * parent's global temporary persistence, so it would be given permanent,
+	 * cluster-wide storage underneath a parent whose data is per-session.
+	 * Reject the command rather than silently creating such an inconsistent
+	 * partition (this function is only reached from SPLIT/MERGE PARTITION).
+	 */
+	if (parent_relform->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("cannot split or merge partitions of global temporary table \"%s\"",
 					   RelationGetRelationName(parent_rel)));
 
 	/* Create the relation. */

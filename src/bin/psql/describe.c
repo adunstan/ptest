@@ -4311,10 +4311,12 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
 						  "WHEN " CppAsString2(RELPERSISTENCE_PERMANENT) " THEN '%s' "
 						  "WHEN " CppAsString2(RELPERSISTENCE_TEMP) " THEN '%s' "
 						  "WHEN " CppAsString2(RELPERSISTENCE_UNLOGGED) " THEN '%s' "
+						  "WHEN " CppAsString2(RELPERSISTENCE_GLOBAL_TEMP) " THEN '%s' "
 						  "END as \"%s\"",
 						  gettext_noop("permanent"),
 						  gettext_noop("temporary"),
 						  gettext_noop("unlogged"),
+						  gettext_noop("global temporary"),
 						  gettext_noop("Persistence"));
 		translate_columns[cols_so_far] = true;
 

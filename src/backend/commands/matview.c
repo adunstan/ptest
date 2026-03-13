@@ -428,6 +428,27 @@ refresh_matview_datafill(DestReceiver *dest, Query *query,
 	plan = pg_plan_query(query, queryString, CURSOR_OPT_PARALLEL_OK, NULL, NULL);
 
 	/*
+	 * A materialized view must not read a global temporary table: GTT
+	 * contents are session-private, while the matview's heap is permanent and
+	 * shared, so populating it would capture -- and publish -- one session's
+	 * private rows.  Direct references are rejected at creation time (see
+	 * transformCreateTableAsStmt), but a GTT reached through a view only
+	 * appears once the planner has flattened the view into the range table,
+	 * so check the planned rtable here.  This covers both CREATE MATERIALIZED
+	 * VIEW ... WITH DATA and REFRESH.
+	 */
+	foreach_node(RangeTblEntry, rte, plan->rtable)
+	{
+		if (rte->rtekind == RTE_RELATION &&
+			get_rel_persistence(rte->relid) == RELPERSISTENCE_GLOBAL_TEMP)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("materialized views must not use temporary objects"),
+					 errdetail("This view depends on global temporary table \"%s\".",
+							   get_rel_name(rte->relid))));
+	}
+
+	/*
 	 * Use a snapshot with an updated command ID to ensure this query sees
 	 * results of any previously executed queries.  (This could only matter if
 	 * the planner executed an allegedly-stable function that changed the

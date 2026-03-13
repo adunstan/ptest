@@ -127,9 +127,11 @@ extern void recordDependencyOnSingleRelExpr(const ObjectAddress *depender,
 
 extern bool find_temp_object(const ObjectAddresses *addrs,
 							 bool local_temp_okay,
+							 bool include_gtt,
 							 ObjectAddress *foundobj);
 
-extern bool query_uses_temp_object(Query *query, ObjectAddress *temp_object);
+extern bool query_uses_temp_object(Query *query, bool include_gtt,
+								   ObjectAddress *temp_object);
 
 extern ObjectAddresses *new_object_addresses(void);
 

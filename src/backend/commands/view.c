@@ -477,6 +477,16 @@ DefineView(ViewStmt *stmt, const char *queryString,
 				 errmsg("views cannot be unlogged because they do not have storage")));
 
 	/*
+	 * Nor are global temporary views: a view has no per-session data for the
+	 * GTT machinery to manage, and downstream code would wrongly treat the
+	 * relation as having session-private storage.
+	 */
+	if (stmt->view->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("views cannot be global temporary because they do not have storage")));
+
+	/*
 	 * If the user didn't explicitly ask for a temporary view, check whether
 	 * we need one implicitly.  We allow TEMP to be inserted automatically as
 	 * long as the CREATE command is consistent with that --- no explicit
@@ -484,7 +494,7 @@ DefineView(ViewStmt *stmt, const char *queryString,
 	 */
 	view = copyObject(stmt->view);	/* don't corrupt original command */
 	if (view->relpersistence == RELPERSISTENCE_PERMANENT
-		&& query_uses_temp_object(viewParse, &temp_object))
+		&& query_uses_temp_object(viewParse, false, &temp_object))
 	{
 		view->relpersistence = RELPERSISTENCE_TEMP;
 		ereport(NOTICE,

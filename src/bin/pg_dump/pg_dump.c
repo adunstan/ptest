@@ -17453,6 +17453,8 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 		 * ignore it when dumping if it was set in this case.
 		 */
 		appendPQExpBuffer(q, "CREATE %s%s %s",
+						  tbinfo->relpersistence == RELPERSISTENCE_GLOBAL_TEMP ?
+						  "GLOBAL TEMPORARY " :
 						  (tbinfo->relpersistence == RELPERSISTENCE_UNLOGGED &&
 						   tbinfo->relkind != RELKIND_PARTITIONED_TABLE) ?
 						  "UNLOGGED " : "",

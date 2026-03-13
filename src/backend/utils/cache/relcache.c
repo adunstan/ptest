@@ -1158,6 +1158,7 @@ retry:
 	{
 		case RELPERSISTENCE_UNLOGGED:
 		case RELPERSISTENCE_PERMANENT:
+		case RELPERSISTENCE_GLOBAL_TEMP:
 			relation->rd_backend = INVALID_PROC_NUMBER;
 			relation->rd_islocaltemp = false;
 			break;
@@ -3653,6 +3654,7 @@ RelationBuildLocalRelation(const char *relname,
 	{
 		case RELPERSISTENCE_UNLOGGED:
 		case RELPERSISTENCE_PERMANENT:
+		case RELPERSISTENCE_GLOBAL_TEMP:
 			rel->rd_backend = INVALID_PROC_NUMBER;
 			rel->rd_islocaltemp = false;
 			break;

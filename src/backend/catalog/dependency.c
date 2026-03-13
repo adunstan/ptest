@@ -29,6 +29,7 @@
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_attrdef.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_auth_members.h"
 #include "catalog/pg_cast.h"
 #include "catalog/pg_collation.h"
@@ -2533,6 +2534,14 @@ process_function_rte_ref(RangeTblEntry *rte, AttrNumber attnum,
  * local_temp_okay is true.  If one is found, return true after storing its
  * address in *foundobj.
  *
+ * If include_gtt is true, relations that are global temporary
+ * tables also count as temporary objects.  GTTs live in ordinary schemas,
+ * so the namespace test never catches them; but their *data* is
+ * session-private, which is what callers like the materialized-view check
+ * care about.  Callers that only care about object lifetime (e.g. the
+ * temporary-view downgrade, where the GTT definition's persistence is what
+ * matters) pass false.
+ *
  * Current callers only use this to deliver helpful notices, so reporting
  * one such object seems sufficient.  We return the first one, which should
  * be a stable result for a given query since it depends only on the order
@@ -2542,12 +2551,21 @@ process_function_rte_ref(RangeTblEntry *rte, AttrNumber attnum,
  */
 bool
 find_temp_object(const ObjectAddresses *addrs, bool local_temp_okay,
-				 ObjectAddress *foundobj)
+				 bool include_gtt, ObjectAddress *foundobj)
 {
 	for (int i = 0; i < addrs->numrefs; i++)
 	{
 		const ObjectAddress *thisobj = addrs->refs + i;
 		Oid			objnamespace;
+
+		/* Global temporary tables hold session-private data. */
+		if (include_gtt &&
+			thisobj->classId == RelationRelationId &&
+			get_rel_persistence(thisobj->objectId) == RELPERSISTENCE_GLOBAL_TEMP)
+		{
+			*foundobj = *thisobj;
+			return true;
+		}
 
 		/*
 		 * Use get_object_namespace() to see if this object belongs to a
@@ -2573,10 +2591,12 @@ find_temp_object(const ObjectAddresses *addrs, bool local_temp_okay,
  * query_uses_temp_object - convenience wrapper for find_temp_object
  *
  * If the Query includes any use of a temporary object, fill *temp_object
- * with the address of one such object and return true.
+ * with the address of one such object and return true.  See
+ * find_temp_object for the meaning of include_gtt.
  */
 bool
-query_uses_temp_object(Query *query, ObjectAddress *temp_object)
+query_uses_temp_object(Query *query, bool include_gtt,
+					   ObjectAddress *temp_object)
 {
 	bool		result;
 	ObjectAddresses *addrs;
@@ -2587,7 +2607,7 @@ query_uses_temp_object(Query *query, ObjectAddress *temp_object)
 	collectDependenciesOfExpr(addrs, (Node *) query, NIL);
 
 	/* Look for one that is temp */
-	result = find_temp_object(addrs, false, temp_object);
+	result = find_temp_object(addrs, false, include_gtt, temp_object);
 
 	free_object_addresses(addrs);
 

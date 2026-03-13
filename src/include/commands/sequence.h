@@ -17,6 +17,7 @@
 #include "fmgr.h"
 #include "nodes/parsenodes.h"
 #include "parser/parse_node.h"
+#include "utils/relcache.h"
 
 typedef struct FormData_pg_sequence_data
 {
@@ -49,5 +50,6 @@ extern void DeleteSequenceTuple(Oid relid);
 extern void ResetSequence(Oid seq_relid);
 extern void SetSequence(Oid relid, int64 next, bool iscalled);
 extern void ResetSequenceCaches(void);
+extern void GttEnsureSequenceInitialized(Relation rel);
 
 #endif							/* SEQUENCE_H */

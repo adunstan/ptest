@@ -676,7 +676,8 @@ ProcedureCreate(const char *procedureName,
 	 * function created in our own pg_temp namespace refers to other objects
 	 * in that namespace, since then they'll have similar lifespans anyway.
 	 */
-	if (find_temp_object(addrs, isTempNamespace(procNamespace), &temp_object))
+	if (find_temp_object(addrs, isTempNamespace(procNamespace), false,
+						 &temp_object))
 		ereport(NOTICE,
 				(errmsg("function \"%s\" will be effectively temporary",
 						procedureName),

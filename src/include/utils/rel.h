@@ -642,8 +642,19 @@ RelationCloseSmgr(Relation relation)
 	   relation->rd_firstRelfilelocatorSubid == InvalidSubTransactionId)))
 
 /*
+ * RelationIsGlobalTemp
+ *		True if relation is a global temporary table.
+ */
+#define RelationIsGlobalTemp(relation) \
+	((relation)->rd_rel->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+
+/*
  * RelationUsesLocalBuffers
  *		True if relation's pages are stored in local buffers.
+ *
+ * Note: global temporary tables will use local buffers for per-session
+ * data storage once that infrastructure is implemented.  For now, their
+ * shared catalog storage uses shared buffers like permanent tables.
  */
 #define RelationUsesLocalBuffers(relation) \
 	((relation)->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
