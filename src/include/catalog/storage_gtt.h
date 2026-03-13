@@ -17,8 +17,15 @@
 
 extern void GttInitSessionStorage(Relation relation);
 extern void GttEnsureSessionStorage(Relation relation);
+extern void GttSetNewSessionRelfilenumber(Relation relation,
+										  RelFileNumber newrelfilenumber);
 extern bool GttHasSessionStorage(Oid relid);
+extern bool GttSessionIndexUsable(Oid relid);
 extern void GttScheduleDropSessionStorage(Oid relid);
+extern void GttBuildIndexIfNeeded(Relation indexRelation);
+extern void GttMarkIndexBuildDeferred(Relation indexRelation);
+extern void GttPrepareIndexAccess(Relation indexRelation);
 extern void PreCommit_gtt_on_commit(void);
+extern void GttResetAllSessionData(void);
 
 #endif							/* STORAGE_GTT_H */

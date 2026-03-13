@@ -37,6 +37,7 @@
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
+#include "catalog/storage_gtt.h"
 
 static BTMetaPageData *_bt_getmeta(Relation rel, Buffer metabuf);
 static void _bt_delitems_delete(Relation rel, Buffer buf,
@@ -680,6 +681,15 @@ int
 _bt_getrootheight(Relation rel)
 {
 	BTMetaPageData *metad;
+
+	/*
+	 * An unmaterialized GTT index has no metapage to read; it is empty, so
+	 * its height is zero.  This keeps planning (get_relation_info) from
+	 * materializing per-session storage.
+	 */
+	if (RelationIsGlobalTemp(rel) &&
+		!GttSessionIndexUsable(RelationGetRelid(rel)))
+		return 0;
 
 	if (rel->rd_amcache == NULL)
 	{

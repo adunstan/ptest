@@ -431,6 +431,7 @@ cmpEntries(const void *a, const void *b, void *arg)
 #define ST_DEFINE
 #define ST_DECLARE
 #include "lib/sort_template.h"
+#include "catalog/storage_gtt.h"
 
 /*
  * Extract the index key values from an indexable item
@@ -580,6 +581,22 @@ ginGetStats(Relation index, GinStatsData *stats)
 	Buffer		metabuffer;
 	Page		metapage;
 	GinMetaPageData *metadata;
+
+	/*
+	 * An unmaterialized GTT index has no metapage to read; report it empty so
+	 * that planning does not materialize per-session storage.
+	 */
+	if (RelationIsGlobalTemp(index) &&
+		!GttSessionIndexUsable(RelationGetRelid(index)))
+	{
+		stats->nPendingPages = 0;
+		stats->nTotalPages = 0;
+		stats->nEntryPages = 0;
+		stats->nDataPages = 0;
+		stats->nEntries = 0;
+		stats->ginVersion = GIN_CURRENT_VERSION;
+		return;
+	}
 
 	metabuffer = ReadBuffer(index, GIN_METAPAGE_BLKNO);
 	LockBuffer(metabuffer, GIN_SHARE);

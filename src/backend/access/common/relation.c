@@ -23,6 +23,7 @@
 #include "access/relation.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "catalog/storage_gtt.h"
 #include "commands/sequence.h"
 #include "pgstat.h"
 #include "storage/lmgr.h"
@@ -35,15 +36,19 @@ static void relation_open_gtt_prepare(Relation r);
 /*
  * relation_open_gtt_prepare
  *		Lazily materialize the session-local pieces of a global temporary
- *		relation that need more than bare storage: sequences must be seeded
- *		with their initial tuple.  Doing this here, at the single chokepoint
- *		every open funnels through, covers direct relation_open callers
- *		(executor scans of a sequence) as well as the sequence functions.
+ *		relation that need more than the bare storage file created at
+ *		relcache-build time: indexes must be built and sequences seeded
+ *		with their initial tuple.  Doing this here, at the single
+ *		chokepoint every open funnels through, covers direct
+ *		relation_open callers (pgstattuple, amcheck, executor scans of a
+ *		sequence) as well as index_open.
  */
 static void
 relation_open_gtt_prepare(Relation r)
 {
-	if (r->rd_rel->relkind == RELKIND_SEQUENCE)
+	if (r->rd_rel->relkind == RELKIND_INDEX)
+		GttBuildIndexIfNeeded(r);
+	else if (r->rd_rel->relkind == RELKIND_SEQUENCE)
 		GttEnsureSequenceInitialized(r);
 }
 

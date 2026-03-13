@@ -46,6 +46,7 @@
 #include "utils/rel.h"
 #include "utils/tuplesort.h"
 #include "utils/wait_event.h"
+#include "catalog/storage_gtt.h"
 
 /* Magic numbers for parallel state sharing */
 #define PARALLEL_KEY_BRIN_SHARED		UINT64CONST(0xB000000000000001)
@@ -1655,6 +1656,18 @@ brinGetStats(Relation index, BrinStatsData *stats)
 	Buffer		metabuffer;
 	Page		metapage;
 	BrinMetaPageData *metadata;
+
+	/*
+	 * An unmaterialized GTT index has no metapage to read; report it empty so
+	 * that planning does not materialize per-session storage.
+	 */
+	if (RelationIsGlobalTemp(index) &&
+		!GttSessionIndexUsable(RelationGetRelid(index)))
+	{
+		stats->pagesPerRange = BrinGetPagesPerRange(index);
+		stats->revmapNumPages = 0;
+		return;
+	}
 
 	metabuffer = ReadBuffer(index, BRIN_METAPAGE_BLKNO);
 	LockBuffer(metabuffer, BUFFER_LOCK_SHARE);

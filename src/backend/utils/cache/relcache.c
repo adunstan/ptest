@@ -3850,6 +3850,48 @@ RelationSetNewRelfilenumber(Relation relation, char persistence)
 				 errmsg("unexpected request for new relfilenumber in binary upgrade mode")));
 
 	/*
+	 * Global temporary tables: the shared pg_class row must keep its
+	 * relfilenode, because every session derives its private storage path
+	 * from it.  Swap only this session's private storage for a new, empty
+	 * file.  The file-level work is transactional through the same
+	 * pending-delete entries as the regular path; the session-local mapping
+	 * is reverted on abort by the undo log in storage_gtt.c.
+	 */
+	if (RelationIsGlobalTemp(relation))
+	{
+		/* GTTs cannot change persistence (ALTER SET LOGGED etc. is blocked) */
+		Assert(persistence == RELPERSISTENCE_GLOBAL_TEMP);
+
+		/* Schedule unlinking of the old per-session storage at commit. */
+		RelationDropStorage(relation);
+
+		newrlocator = relation->rd_locator;
+		newrlocator.relNumber = newrelfilenumber;
+
+		if (RELKIND_HAS_TABLE_AM(relation->rd_rel->relkind))
+		{
+			/* freezeXid/minmulti are tracked per session, not in pg_class */
+			table_relation_set_new_filelocator(relation, &newrlocator,
+											   persistence,
+											   &freezeXid, &minmulti);
+		}
+		else if (RELKIND_HAS_STORAGE(relation->rd_rel->relkind))
+		{
+			SMgrRelation srel;
+
+			srel = RelationCreateStorage(newrlocator, persistence, true);
+			smgrclose(srel);
+		}
+		else
+			elog(ERROR, "relation \"%s\" does not have storage",
+				 RelationGetRelationName(relation));
+
+		GttSetNewSessionRelfilenumber(relation, newrelfilenumber);
+		RelationAssumeNewRelfilelocator(relation);
+		return;
+	}
+
+	/*
 	 * Get a writable copy of the pg_class tuple for the given relation.
 	 */
 	pg_class = table_open(RelationRelationId, RowExclusiveLock);

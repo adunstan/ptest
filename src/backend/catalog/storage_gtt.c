@@ -21,13 +21,18 @@
  */
 #include "postgres.h"
 
+#include "access/amapi.h"
+#include "access/relation.h"
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/heap.h"
+#include "catalog/index.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage.h"
 #include "catalog/storage_gtt.h"
+#include "commands/sequence.h"
+#include "commands/tablecmds.h"
 #include "common/hashfn.h"
 #include "miscadmin.h"
 #include "nodes/pg_list.h"
@@ -37,6 +42,7 @@
 #include "storage/smgr.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
@@ -50,6 +56,7 @@
  *     (InvalidSubTransactionId once the entry has survived to top-level
  *     commit)
  *   - storage_subid: subxact that most recently called RelationCreateStorage
+ *   - index_subid: subxact that built the index for this session
  * On subxact or xact abort of a given subid, the corresponding state is
  * reverted.  On subxact commit, the subid is reparented.  See
  * gtt_subxact_callback / gtt_xact_callback.
@@ -57,14 +64,21 @@
 typedef struct GttStorageEntry
 {
 	Oid			relid;			/* GTT's pg_class OID (hash key) */
+	Oid			heap_relid;		/* parent heap for indexes, InvalidOid for
+								 * heap entries themselves */
 	Oid			toast_relid;	/* toast relation for heap entries, InvalidOid
 								 * if none / not a heap */
 	RelFileLocator locator;		/* per-session physical storage location */
 	bool		storage_created;	/* has smgr file been created? */
+	bool		is_index;		/* is this an index relation? */
+	bool		index_built;	/* has index been built in this session? */
+	bool		build_deferred; /* index_build deferred the physical build
+								 * because the parent heap was unmaterialized */
 	bool		on_commit_delete;	/* truncate data on commit? */
 	bool		drop_pending;	/* entry scheduled for drop at xact commit */
 	SubTransactionId create_subid;	/* subxact that added this entry */
 	SubTransactionId storage_subid; /* subxact that created current storage */
+	SubTransactionId index_subid;	/* subxact that built the index */
 } GttStorageEntry;
 
 /* Backend-local hash table: GTT OID -> GttStorageEntry */
@@ -72,12 +86,36 @@ static HTAB *gtt_storage_hash = NULL;
 
 /*
  * True when any entry carries rollback-sensitive state (a valid
- * create_subid/storage_subid, or drop_pending), letting the xact/subxact
- * callbacks skip their full-hash scans in the common case of a transaction
- * that established no such state.  Conservative: it is only cleared once a
- * top-level transaction end has settled every entry.
+ * create_subid/storage_subid/index_subid, or drop_pending), letting the
+ * xact/subxact callbacks skip their full-hash scans in the common case of
+ * a transaction that established no such state.  Conservative: it is only
+ * cleared once a top-level transaction end has settled every entry.
  */
 static bool gtt_xact_state_dirty = false;
+
+/*
+ * Undo log for transactional swaps of a GTT's session-local relfilenumber
+ * (RelationSetNewRelfilenumber on a GTT; reached from TRUNCATE, ALTER
+ * SEQUENCE ... RESTART, and the like).  The file-level work is rolled back
+ * by the regular PendingRelDelete machinery; these records roll back the
+ * session-local mapping and the per-entry state the swap reset.  One record
+ * is pushed per swap, newest first; subxact commit reparents records to the
+ * parent, abort restores and discards them, top-level commit discards them.
+ */
+typedef struct GttSwapUndo
+{
+	Oid			relid;			/* which GTT was swapped */
+	SubTransactionId subid;		/* subxact that performed the swap */
+	RelFileNumber prev_relnumber;	/* mapping to restore on abort */
+	bool		prev_index_built;
+	bool		prev_build_deferred;
+} GttSwapUndo;
+
+/* List of GttSwapUndo *, newest first, allocated in TopMemoryContext */
+static List *gtt_swap_undo = NIL;
+
+/* Guard against recursive index builds */
+static bool gtt_building_index = false;
 
 /* Local function prototypes */
 static void gtt_session_cleanup(int code, Datum arg);
@@ -91,7 +129,9 @@ static void gtt_remove_entry(GttStorageEntry *entry);
 static void gtt_revert_storage(GttStorageEntry *entry);
 static void gtt_remove_relids(List *to_remove);
 static void gtt_init_entry(GttStorageEntry *entry, Relation relation);
+static void gtt_build_index_internal(Relation indexRelation, bool force);
 static void gtt_truncate_smgr(GttStorageEntry *entry);
+static void gtt_swap_undo_apply(GttSwapUndo *undo);
 
 /*
  * ensure_gtt_hash
@@ -189,6 +229,29 @@ GttInitSessionStorage(Relation relation)
 		OidIsValid(relation->rd_rel->reltoastrelid))
 		entry->toast_relid = relation->rd_rel->reltoastrelid;
 
+	/*
+	 * RelationBuildLocalRelation (the path used by index_create) leaves
+	 * rd_index NULL: pg_index has not yet been inserted, so the index access
+	 * info cannot be filled in.  Our first call therefore left heap_relid as
+	 * InvalidOid for indexes.  Backfill it now that
+	 * RelationInitIndexAccessInfo has supplied rd_index, so
+	 * PreCommit_gtt_on_commit can find which heap each index belongs to.
+	 */
+	if (entry->is_index && !OidIsValid(entry->heap_relid) &&
+		relation->rd_index != NULL)
+		entry->heap_relid = relation->rd_index->indrelid;
+
+	/*
+	 * Our hash entry tracks this session's current storage for the GTT.  It
+	 * starts out equal to the catalog relfilenode, but a transactional
+	 * TRUNCATE swaps in a new session-local relfilenumber via
+	 * GttSetNewSessionRelfilenumber without touching the shared catalog, so
+	 * the two may legitimately diverge.  CLUSTER, REINDEX, SET TABLESPACE,
+	 * SET LOGGED and heap rewrites (which would rotate the shared relfilenode
+	 * itself) remain blocked for GTTs.
+	 */
+	Assert(RelFileNumberIsValid(entry->locator.relNumber));
+
 	/* Point the relation at our per-session storage */
 	relation->rd_locator = entry->locator;
 	relation->rd_backend = ProcNumberForTempRelations();
@@ -231,10 +294,18 @@ gtt_init_entry(GttStorageEntry *entry, Relation relation)
 	 */
 	entry->locator.relNumber = relation->rd_rel->relfilenode;
 	entry->storage_created = false;
+	entry->is_index = (relation->rd_rel->relkind == RELKIND_INDEX);
+	if (entry->is_index && relation->rd_index != NULL)
+		entry->heap_relid = relation->rd_index->indrelid;
+	else
+		entry->heap_relid = InvalidOid;
+	entry->index_built = false;
+	entry->build_deferred = false;
 	entry->drop_pending = false;
 	entry->create_subid = GetCurrentSubTransactionId();
 	gtt_xact_state_dirty = true;
 	entry->storage_subid = InvalidSubTransactionId;
+	entry->index_subid = InvalidSubTransactionId;
 	entry->on_commit_delete = false;
 	entry->toast_relid = InvalidOid;
 }
@@ -272,6 +343,139 @@ GttEnsureSessionStorage(Relation relation)
 	entry->storage_created = true;
 	entry->storage_subid = GetCurrentSubTransactionId();
 	gtt_xact_state_dirty = true;
+
+	/*
+	 * When a heap materializes -- typically at the top of the first
+	 * heap_insert, before the row is written -- bring its indexes along while
+	 * the heap is still empty.  Opening each index runs the relation_open
+	 * build hook, which now fires because the heap has storage.  Building
+	 * here, rather than when index_insert first touches an index, is what
+	 * keeps a lazy build from indexing the very row whose insertion triggered
+	 * it (which the subsequent aminsert would then insert a second time).
+	 */
+	if (!entry->is_index &&
+		relation->rd_rel->relkind != RELKIND_SEQUENCE)
+	{
+		List	   *indexoids = RelationGetIndexList(relation);
+
+		foreach_oid(idxoid, indexoids)
+		{
+			Relation	idxrel = index_open(idxoid, AccessShareLock);
+
+			index_close(idxrel, NoLock);
+		}
+		list_free(indexoids);
+	}
+}
+
+/*
+ * GttSetNewSessionRelfilenumber
+ *		Point this session's storage mapping for a GTT at a new, empty file.
+ *
+ * Called from RelationSetNewRelfilenumber after it has created the new
+ * per-session file and scheduled the old one for unlink-at-commit.  The
+ * shared pg_class row is deliberately left untouched: other sessions derive
+ * their private storage paths from the catalog relfilenode, so only this
+ * session's mapping changes.
+ *
+ * The swap is transactional: an undo record restores the previous mapping
+ * and the per-entry state reset here if the (sub)transaction aborts, while
+ * the file-level rollback is handled by the PendingRelDelete entries the
+ * caller registered.
+ */
+void
+GttSetNewSessionRelfilenumber(Relation relation, RelFileNumber newrelfilenumber)
+{
+	GttStorageEntry *entry;
+	GttSwapUndo *undo;
+	MemoryContext oldcxt;
+	Oid			relid = RelationGetRelid(relation);
+
+	Assert(RelationIsGlobalTemp(relation));
+
+	if (gtt_storage_hash == NULL)
+		elog(ERROR, "no per-session storage map for global temporary table \"%s\"",
+			 RelationGetRelationName(relation));
+
+	entry = (GttStorageEntry *) hash_search(gtt_storage_hash, &relid,
+											HASH_FIND, NULL);
+	if (entry == NULL)
+		elog(ERROR, "no per-session storage entry for global temporary table \"%s\"",
+			 RelationGetRelationName(relation));
+
+	/*
+	 * Swaps only ever apply to materialized storage: TRUNCATE skips
+	 * unmaterialized relations, and sequences are materialized at open. This
+	 * matters because the swap does not register in the sessions registry --
+	 * it relies on GttEnsureSessionStorage having done so.
+	 */
+	Assert(entry->storage_created);
+
+	/* Push the undo record before changing anything. */
+	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+	undo = palloc_object(GttSwapUndo);
+	undo->relid = relid;
+	undo->subid = GetCurrentSubTransactionId();
+	undo->prev_relnumber = entry->locator.relNumber;
+	undo->prev_index_built = entry->index_built;
+	undo->prev_build_deferred = entry->build_deferred;
+	gtt_swap_undo = lcons(undo, gtt_swap_undo);
+	MemoryContextSwitchTo(oldcxt);
+
+	entry->locator.relNumber = newrelfilenumber;
+	entry->storage_created = true;
+
+	/*
+	 * The new file is empty: indexes must be lazily rebuilt on next access
+	 * (GttBuildIndexIfNeeded).
+	 */
+	if (entry->is_index)
+	{
+		entry->index_built = false;
+
+		/*
+		 * For an index created earlier in this same transaction, the usual
+		 * assumption that index_create() handles the initial build no longer
+		 * holds: that build went into the file being swapped out.  Record the
+		 * build as genuinely outstanding so gtt_build_index_internal rebuilds
+		 * into the new empty file on next access.
+		 */
+		if (relation->rd_createSubid != InvalidSubTransactionId)
+			entry->build_deferred = true;
+	}
+
+	/* Point the open relcache entry at the new storage. */
+	relation->rd_locator = entry->locator;
+	RelationCloseSmgr(relation);
+}
+
+/*
+ * gtt_swap_undo_apply
+ *		Restore the session-local state captured by one swap-undo record.
+ *
+ * The file created by the swap is unlinked, and the pre-swap file's
+ * unlink-at-commit canceled, by the PendingRelDelete machinery; here we
+ * restore the mapping and per-entry bookkeeping to match.
+ */
+static void
+gtt_swap_undo_apply(GttSwapUndo *undo)
+{
+	GttStorageEntry *entry;
+
+	entry = (GttStorageEntry *) hash_search(gtt_storage_hash, &undo->relid,
+											HASH_FIND, NULL);
+	if (entry == NULL)
+		return;					/* entry itself is being removed by abort */
+
+	entry->locator.relNumber = undo->prev_relnumber;
+	entry->index_built = undo->prev_index_built;
+	entry->build_deferred = undo->prev_build_deferred;
+
+	/*
+	 * Refresh the relcache entry so rd_locator points back at the surviving
+	 * pre-swap file on next access.
+	 */
+	RelationCacheInvalidateEntry(undo->relid);
 }
 
 /*
@@ -289,6 +493,34 @@ GttHasSessionStorage(Oid relid)
 		return false;
 
 	return hash_search(gtt_storage_hash, &relid, HASH_FIND, NULL) != NULL;
+}
+
+/*
+ * GttSessionIndexUsable
+ *		Is this session's copy of a GTT index materialized AND built?
+ *
+ * Readers of index structure that bypass the index AM's own access paths
+ * -- the plan-time metapage peeks (_bt_getrootheight, ginGetStats,
+ * brinGetStats), amcanreturn, and diagnostic readers like pgstattuple --
+ * must treat an index that is materialized but not built as empty rather
+ * than read pages that may not exist.  That state is reachable: a swap
+ * (TRUNCATE) points the mapping at a fresh zero-block file, and the abort
+ * pass that reverts a heap's storage physically empties its surviving
+ * indexes (gtt_truncate_dependents), both clearing index_built so the next
+ * genuine index access rebuilds the structure.  Plan-time readers must not
+ * be the ones to trigger that rebuild.
+ */
+bool
+GttSessionIndexUsable(Oid relid)
+{
+	GttStorageEntry *entry;
+
+	if (gtt_storage_hash == NULL)
+		return false;
+
+	entry = (GttStorageEntry *) hash_search(gtt_storage_hash, &relid,
+											HASH_FIND, NULL);
+	return entry != NULL && entry->storage_created && entry->index_built;
 }
 
 /*
@@ -346,13 +578,39 @@ GttScheduleDropSessionStorage(Oid relid)
  *		Undo lazily-created storage state on (sub)transaction abort.
  *
  * The files themselves have been unlinked by PendingRelDelete; reset the
- * bookkeeping so the next access re-creates the storage.
+ * bookkeeping so the next access re-creates the storage, and restart the
+ * xid horizon tracking, since no data survives.  The caller must also
+ * remove the relation from the shared sessions registry (we cannot take
+ * the registry LWLock here, mid-hash-scan); with the storage gone there
+ * is no live data left for peer DDL to respect.
  */
 static void
 gtt_revert_storage(GttStorageEntry *entry)
 {
 	entry->storage_created = false;
 	entry->storage_subid = InvalidSubTransactionId;
+
+	/*
+	 * No storage means no index structure: any build this entry ever had
+	 * lived in the files just unlinked.  This must be enforced here rather
+	 * than left to the index_subid bookkeeping, because under nested aborts a
+	 * swap-undo record from an outer subtransaction can re-restore
+	 * index_built=true after an inner subtransaction's abort already cleared
+	 * index_subid -- leaving a "built" index with no file behind it.
+	 */
+	entry->index_built = false;
+	entry->index_subid = InvalidSubTransactionId;
+
+	/*
+	 * Reverting an index's storage also revives its outstanding-build mark:
+	 * if the index was created in this same transaction, the build that
+	 * index_create (or a deferred-build hook) performed went down with the
+	 * reverted file, and gtt_build_index_internal's index_create skip would
+	 * otherwise block the rebuild on the next materialization.  Harmless for
+	 * pre-existing indexes, whose rebuild never consults the mark.
+	 */
+	if (entry->is_index)
+		entry->build_deferred = true;
 }
 
 /*
@@ -415,8 +673,28 @@ gtt_xact_callback(XactEvent event, void *arg)
 	 * don't pay for a full-hash scan at every commit for the rest of the
 	 * session's life just because a GTT was once used.
 	 */
-	if (!gtt_xact_state_dirty)
+	if (!gtt_xact_state_dirty && gtt_swap_undo == NIL)
 		return;
+
+	/*
+	 * Settle the relfilenumber-swap undo log first.  On abort, restore the
+	 * pre-swap state, newest record first, so that the oldest record (the
+	 * state from before the transaction's first swap) lands last; this must
+	 * run before the storage_subid processing below so that storage created
+	 * and then swapped within the aborting transaction still ends up with
+	 * storage_created cleared.  On commit the swaps are final and the records
+	 * are simply discarded.
+	 */
+	if (gtt_swap_undo != NIL)
+	{
+		if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT)
+		{
+			foreach(lc, gtt_swap_undo)
+				gtt_swap_undo_apply((GttSwapUndo *) lfirst(lc));
+		}
+		list_free_deep(gtt_swap_undo);
+		gtt_swap_undo = NIL;
+	}
 
 	hash_seq_init(&status, gtt_storage_hash);
 	while ((entry = (GttStorageEntry *) hash_seq_search(&status)) != NULL)
@@ -432,6 +710,7 @@ gtt_xact_callback(XactEvent event, void *arg)
 			{
 				entry->create_subid = InvalidSubTransactionId;
 				entry->storage_subid = InvalidSubTransactionId;
+				entry->index_subid = InvalidSubTransactionId;
 			}
 		}
 		else
@@ -456,6 +735,11 @@ gtt_xact_callback(XactEvent event, void *arg)
 				{
 					gtt_revert_storage(entry);
 					to_invalidate = lappend_oid(to_invalidate, entry->relid);
+				}
+				if (entry->index_subid != InvalidSubTransactionId)
+				{
+					entry->index_built = false;
+					entry->index_subid = InvalidSubTransactionId;
 				}
 				entry->drop_pending = false;
 			}
@@ -503,8 +787,31 @@ gtt_subxact_callback(SubXactEvent event,
 		return;
 
 	/* As in gtt_xact_callback, skip the scans if nothing can need work. */
-	if (!gtt_xact_state_dirty)
+	if (!gtt_xact_state_dirty && gtt_swap_undo == NIL)
 		return;
+
+	/*
+	 * Settle relfilenumber-swap undo records belonging to this subxact: on
+	 * commit reparent them, on abort restore the pre-swap state and discard
+	 * them.  As in gtt_xact_callback, restoring must precede the
+	 * storage_subid processing below.
+	 */
+	foreach(lc, gtt_swap_undo)
+	{
+		GttSwapUndo *undo = (GttSwapUndo *) lfirst(lc);
+
+		if (undo->subid != mySubid)
+			continue;
+
+		if (event == SUBXACT_EVENT_COMMIT_SUB)
+			undo->subid = parentSubid;
+		else
+		{
+			gtt_swap_undo_apply(undo);
+			gtt_swap_undo = foreach_delete_current(gtt_swap_undo, lc);
+			pfree(undo);
+		}
+	}
 
 	hash_seq_init(&status, gtt_storage_hash);
 	while ((entry = (GttStorageEntry *) hash_seq_search(&status)) != NULL)
@@ -515,6 +822,8 @@ gtt_subxact_callback(SubXactEvent event,
 				entry->create_subid = parentSubid;
 			if (entry->storage_subid == mySubid)
 				entry->storage_subid = parentSubid;
+			if (entry->index_subid == mySubid)
+				entry->index_subid = parentSubid;
 		}
 		else					/* SUBXACT_EVENT_ABORT_SUB */
 		{
@@ -528,6 +837,11 @@ gtt_subxact_callback(SubXactEvent event,
 			{
 				gtt_revert_storage(entry);
 				to_invalidate = lappend_oid(to_invalidate, entry->relid);
+			}
+			if (entry->index_subid == mySubid)
+			{
+				entry->index_built = false;
+				entry->index_subid = InvalidSubTransactionId;
 			}
 		}
 	}
@@ -612,6 +926,227 @@ gtt_truncate_smgr(GttStorageEntry *entry)
 }
 
 /*
+ * gtt_build_index_internal
+ *		Build a GTT index for this session if it hasn't been built yet.
+ *
+ * Per-session index storage starts out unmaterialized; indexes additionally
+ * need their internal structure initialized (e.g. btree metapage) before
+ * the first access.  When "force" is true (index scans and index inserts),
+ * the index storage is materialized and built unconditionally; when false
+ * (relation_open of the index, for direct-readers like pgstattuple), the
+ * build only proceeds if the parent heap already has materialized storage,
+ * so that merely opening an index -- e.g. the planner's get_relation_info
+ * during EXPLAIN -- materializes nothing.
+ *
+ * The build scans the heap through the ordinary table-AM path, so an
+ * unmaterialized heap simply contributes zero rows (via the zero-blocks
+ * short-circuits) and stays unmaterialized.
+ */
+static void
+gtt_build_index_internal(Relation indexRelation, bool force)
+{
+	GttStorageEntry *entry;
+	Oid			relid = RelationGetRelid(indexRelation);
+	Relation	heapRelation = NULL;
+
+	if (gtt_storage_hash == NULL)
+		return;
+
+	/* Prevent recursive builds (index_build may trigger index_open) */
+	if (gtt_building_index)
+		return;
+
+	entry = (GttStorageEntry *) hash_search(gtt_storage_hash,
+											&relid,
+											HASH_FIND,
+											NULL);
+
+	if (entry == NULL || !entry->is_index)
+		return;
+
+	if (entry->index_built)
+	{
+		/* the structure this flag promises must actually exist */
+		Assert(smgrexists(smgropen(entry->locator,
+								   ProcNumberForTempRelations()),
+						  MAIN_FORKNUM) &&
+			   smgrnblocks(smgropen(entry->locator,
+									ProcNumberForTempRelations()),
+						   MAIN_FORKNUM) > 0);
+		return;
+	}
+
+	/*
+	 * If the index was created in the current transaction, index_create()
+	 * normally handles the initial build via index_build(); skip the build
+	 * here to avoid a "already contains data" error from btbuild (this hook
+	 * fires from relation_open inside index_create, and again from the
+	 * index_open in plan_create_index_workers after index_build has already
+	 * materialized the storage).  The exception is an index whose build is
+	 * recorded as genuinely outstanding (build_deferred): either index_build
+	 * explicitly deferred it because the parent heap was unmaterialized, or a
+	 * TRUNCATE swapped the already-built index to a fresh empty file after
+	 * index_create finished.  In both cases this hook is the only thing that
+	 * will ever (re)build the index.
+	 */
+	if (indexRelation->rd_createSubid != InvalidSubTransactionId &&
+		!entry->build_deferred)
+		return;
+
+	if (!force)
+	{
+		GttStorageEntry *heap_entry;
+
+		if (!OidIsValid(entry->heap_relid))
+			return;
+		heap_entry = (GttStorageEntry *) hash_search(gtt_storage_hash,
+													 &entry->heap_relid,
+													 HASH_FIND, NULL);
+		if (heap_entry == NULL || !heap_entry->storage_created)
+			return;
+	}
+
+	/*
+	 * If the index already has blocks (e.g. it was created by this same
+	 * session via CREATE INDEX), it's already been built — just mark it.
+	 * Leave index_subid invalid: the file's content predates the current
+	 * transaction and survives its abort, so this discovery must not be
+	 * rolled back (else an abort of a transaction that merely opened the
+	 * index would force a pointless rebuild).
+	 */
+	if (entry->storage_created &&
+		RelationGetNumberOfBlocks(indexRelation) != 0)
+	{
+		entry->index_built = true;
+		entry->build_deferred = false;
+		return;
+	}
+
+	/* The build is about to write; materialize the index storage. */
+	GttEnsureSessionStorage(indexRelation);
+
+	/*
+	 * Drop any AM-specific cache before rebuilding.  The btree _bt_getroot
+	 * fast path keeps a copy of the metapage in rd_amcache and uses
+	 * btm_fastroot without rereading; if PreCommit_gtt_on_commit truncated
+	 * the index file to zero blocks, that cached block number now points past
+	 * EOF and the next access would fail.  Clearing the cache forces the
+	 * post-rebuild metapage to be reread.
+	 */
+	if (indexRelation->rd_amcache != NULL)
+	{
+		pfree(indexRelation->rd_amcache);
+		indexRelation->rd_amcache = NULL;
+	}
+
+	/*
+	 * Build the index.  Open the heap table, construct the IndexInfo, and
+	 * call ambuild directly.  We use ambuild instead of index_build because
+	 * index_build calls index_update_stats which would update the shared
+	 * pg_class entry — inappropriate for a per-session lazy index build.
+	 *
+	 * For an empty heap, this just initializes the index structure (e.g.
+	 * writes the btree metapage).
+	 *
+	 * Set the guard flag to prevent recursive index builds, since ambuild may
+	 * trigger relcache invalidation that leads back to index_open.
+	 */
+	gtt_building_index = true;
+	PG_TRY();
+	{
+		IndexInfo  *indexInfo;
+
+		heapRelation = table_open(indexRelation->rd_index->indrelid,
+								  AccessShareLock);
+		indexInfo = BuildIndexInfo(indexRelation);
+		indexRelation->rd_indam->ambuild(heapRelation, indexRelation,
+										 indexInfo);
+	}
+	PG_FINALLY();
+	{
+		if (heapRelation != NULL)
+			table_close(heapRelation, AccessShareLock);
+		gtt_building_index = false;
+	}
+	PG_END_TRY();
+
+	/*
+	 * Re-fetch the hash entry after ambuild, because the hash table may have
+	 * been resized during the build (e.g. if opening the heap triggered
+	 * GttInitSessionStorage for other relations).  A concurrent relcache
+	 * invalidation in ambuild could in principle have dropped the entry, so
+	 * cope with NULL rather than asserting.
+	 */
+	entry = (GttStorageEntry *) hash_search(gtt_storage_hash,
+											&relid,
+											HASH_FIND,
+											NULL);
+	if (entry != NULL)
+	{
+		entry->index_built = true;
+		entry->build_deferred = false;
+		entry->index_subid = GetCurrentSubTransactionId();
+		gtt_xact_state_dirty = true;
+	}
+}
+
+/*
+ * GttBuildIndexIfNeeded
+ *		Opportunistically build a GTT index at relation open.
+ *
+ * Builds only when the parent heap already has materialized storage, so
+ * opening an index (planning, EXPLAIN) never materializes anything by
+ * itself, while direct readers such as pgstattuple still find a usable
+ * index whenever there is data to inspect.
+ */
+void
+GttBuildIndexIfNeeded(Relation indexRelation)
+{
+	gtt_build_index_internal(indexRelation, false);
+}
+
+/*
+ * GttMarkIndexBuildDeferred
+ *		Record that index_build deferred this index's physical build.
+ *
+ * Called when CREATE INDEX (or any other index_build) runs while the parent
+ * heap is unmaterialized: the catalog work proceeds, but no per-session
+ * structure is built.  The mark tells gtt_build_index_internal that the
+ * build for this same-transaction-created index is genuinely outstanding,
+ * overriding its usual assumption that index_create() will take care of a
+ * just-created index.
+ */
+void
+GttMarkIndexBuildDeferred(Relation indexRelation)
+{
+	GttStorageEntry *entry;
+	Oid			relid = RelationGetRelid(indexRelation);
+
+	if (gtt_storage_hash == NULL)
+		return;
+
+	entry = (GttStorageEntry *) hash_search(gtt_storage_hash, &relid,
+											HASH_FIND, NULL);
+	if (entry != NULL && entry->is_index && !entry->index_built)
+		entry->build_deferred = true;
+}
+
+/*
+ * GttPrepareIndexAccess
+ *		Make a GTT index usable before a scan or insert.
+ *
+ * Index scans and index inserts genuinely access the index structure, so
+ * the per-session index storage is materialized and built here if needed.
+ * The parent heap is not touched: building over an unmaterialized heap
+ * yields an empty (but structurally valid) index.
+ */
+void
+GttPrepareIndexAccess(Relation indexRelation)
+{
+	gtt_build_index_internal(indexRelation, true);
+}
+
+/*
  * PreCommit_gtt_on_commit
  *		Truncate ON COMMIT DELETE ROWS GTTs at commit.
  *
@@ -631,8 +1166,7 @@ PreCommit_gtt_on_commit(void)
 {
 	HASH_SEQ_STATUS status;
 	GttStorageEntry *entry;
-	List	   *toast_relids = NIL;
-	ListCell   *lc;
+	List	   *heap_relids = NIL;
 
 	if (gtt_storage_hash == NULL)
 		return;
@@ -645,45 +1179,143 @@ PreCommit_gtt_on_commit(void)
 	if (!(MyXactFlags & XACT_FLAGS_ACCESSEDTEMPNAMESPACE))
 		return;
 
+	/* First pass: identify ON COMMIT DELETE ROWS heaps to truncate. */
 	hash_seq_init(&status, gtt_storage_hash);
 	while ((entry = (GttStorageEntry *) hash_seq_search(&status)) != NULL)
 	{
+		if (entry->is_index)
+			continue;
 		if (!entry->on_commit_delete || !entry->storage_created)
 			continue;
 
 		/*
 		 * A heap whose main fork is already empty has not been written since
-		 * its last truncation; skip it -- and thereby its toast -- so that an
-		 * idle ON COMMIT DELETE ROWS table costs each commit no more than
-		 * this block-count probe.
+		 * its last truncation; skip it -- and thereby its indexes and toast
+		 * -- so that an idle ON COMMIT DELETE ROWS table costs each commit no
+		 * more than this block-count probe.  This also keeps an index that
+		 * was lazily built against the empty heap intact, rather than
+		 * truncating and rebuilding it at every commit.
 		 */
 		if (smgrnblocks(smgropen(entry->locator, ProcNumberForTempRelations()),
 						MAIN_FORKNUM) == 0)
 			continue;
 
-		gtt_truncate_smgr(entry);
+		heap_relids = lappend_oid(heap_relids, entry->relid);
 
 		/*
 		 * Queue the toast relation too (if this session ever wrote toasted
-		 * values, an entry for it exists).  Truncating just the heap would
-		 * orphan the toast rows for good: nothing else ever deletes them, and
-		 * autovacuum never visits GTTs.
+		 * values, an entry for it exists); its index is then matched by the
+		 * heap_relids check in the second pass like any other index.
 		 */
 		if (OidIsValid(entry->toast_relid))
-			toast_relids = lappend_oid(toast_relids, entry->toast_relid);
+			heap_relids = lappend_oid(heap_relids, entry->toast_relid);
 	}
 
-	foreach(lc, toast_relids)
-	{
-		Oid			toast_relid = lfirst_oid(lc);
+	if (heap_relids == NIL)
+		return;
 
-		entry = (GttStorageEntry *) hash_search(gtt_storage_hash,
-												&toast_relid,
-												HASH_FIND, NULL);
-		if (entry != NULL && entry->storage_created)
+	/*
+	 * Second pass: truncate the heap entries, plus every index entry whose
+	 * parent heap is in heap_relids, and clear the per-session metadata tied
+	 * to each.  Index AM caches (eg btree's rd_amcache) are dropped lazily by
+	 * GttBuildIndexIfNeeded the next time the index is opened, so we don't
+	 * have to invalidate the relcache here.
+	 *
+	 * Toast tables are truncated along with their parents: each heap entry
+	 * records its toast relation's OID (captured from the relcache in
+	 * GttInitSessionStorage), so the toast heap is in heap_relids and its
+	 * index is caught by the matching below, all without any catalog access
+	 * from this commit-time hook.
+	 */
+	hash_seq_init(&status, gtt_storage_hash);
+	while ((entry = (GttStorageEntry *) hash_seq_search(&status)) != NULL)
+	{
+		if (entry->is_index)
+		{
+			if (OidIsValid(entry->heap_relid) &&
+				list_member_oid(heap_relids, entry->heap_relid))
+			{
+				gtt_truncate_smgr(entry);
+				entry->index_built = false;
+			}
+		}
+		else if (list_member_oid(heap_relids, entry->relid))
 			gtt_truncate_smgr(entry);
 	}
-	list_free(toast_relids);
+
+	list_free(heap_relids);
+}
+
+/*
+ * GttResetAllSessionData
+ *		Clear this session's data in every global temporary table it has
+ *		touched, for DISCARD TEMP / DISCARD ALL.
+ *
+ * Regular temporary tables are dropped outright by DISCARD TEMP; a GTT's
+ * definition is shared and must survive, but its per-session contents are
+ * session state and are cleared here.  This matters especially for
+ * connection poolers, which rely on DISCARD ALL to prevent one client's
+ * session state from leaking to the next.
+ *
+ * Tables are truncated with the transaction-safe session-storage swap
+ * (GttTruncateInSession), and sequences are reset to their start value
+ * (ResetSequence, which also swaps session storage for a GTT sequence), so
+ * a DISCARD TEMP inside a transaction block is rolled back cleanly if the
+ * transaction aborts -- matching the transactional drop of regular temp
+ * tables.
+ */
+void
+GttResetAllSessionData(void)
+{
+	HASH_SEQ_STATUS status;
+	GttStorageEntry *entry;
+	List	   *relids = NIL;
+	Relation	rel;
+
+	if (gtt_storage_hash == NULL)
+		return;
+
+	/* Collect first: truncation work must not run under an active scan. */
+	hash_seq_init(&status, gtt_storage_hash);
+	while ((entry = (GttStorageEntry *) hash_seq_search(&status)) != NULL)
+	{
+		if (entry->is_index || !entry->storage_created)
+			continue;
+		relids = lappend_oid(relids, entry->relid);
+	}
+
+	foreach_oid(relid, relids)
+	{
+		switch (get_rel_relkind(relid))
+		{
+			case RELKIND_RELATION:
+				/*
+				 * Same lock TRUNCATE takes; only this session's storage
+				 * is affected, and peers hold no session-lifetime locks
+				 * that could make this wait for their disconnect.
+				 */
+				rel = try_relation_open(relid, AccessExclusiveLock);
+				if (rel == NULL)
+					break;
+				if (RelationIsGlobalTemp(rel))
+					GttTruncateInSession(rel);
+
+				/*
+				 * hold the lock until end of transaction, as TRUNCATE
+				 * does
+				 */
+				relation_close(rel, NoLock);
+				break;
+			case RELKIND_SEQUENCE:
+				if (get_rel_persistence(relid) == RELPERSISTENCE_GLOBAL_TEMP)
+					ResetSequence(relid);
+				break;
+			default:
+				/* toast relations are reset along with their parents */
+				break;
+		}
+	}
+	list_free(relids);
 }
 
 /*

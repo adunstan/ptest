@@ -56,6 +56,7 @@
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
 #include "catalog/storage.h"
+#include "catalog/storage_gtt.h"
 #include "catalog/storage_xlog.h"
 #include "catalog/toasting.h"
 #include "commands/comment.h"
@@ -1960,6 +1961,97 @@ RangeVarCallbackForDropRelation(const RangeVar *rel, Oid relOid, Oid oldRelOid,
 }
 
 /*
+ * GttTruncateInSession
+ *		Truncate this session's private storage for a global temporary table.
+ *
+ * Used by TRUNCATE and by DISCARD TEMP/ALL.  The caller must hold
+ * AccessExclusiveLock on the relation.  The truncation is transaction-safe:
+ * for a GTT, RelationSetNewRelfilenumber leaves the shared pg_class row
+ * alone and swaps only the session-local storage mapping (with undo on
+ * abort), so the catalog relfilenode that other sessions derive their
+ * storage paths from is unaffected and a ROLLBACK restores the rows.
+ */
+void
+GttTruncateInSession(Relation rel)
+{
+	Oid			toast_relid;
+	List	   *indexoids;
+	ListCell   *ind;
+
+	/*
+	 * Storage that was never materialized holds nothing to truncate, and the
+	 * swap below must not be the thing that materializes it.
+	 */
+	if (!GttHasSessionStorage(RelationGetRelid(rel)))
+		return;
+
+	/*
+	 * As in the regular TRUNCATE path, this may run in a serializable
+	 * transaction, in which case we must record a rw-conflict in to this
+	 * transaction from each transaction holding a predicate lock on the
+	 * table.
+	 */
+	CheckTableForSerializableConflictIn(rel);
+
+	/*
+	 * Transaction-safe truncation, GTT style: swap this session's private
+	 * storage for new, empty files, so a ROLLBACK restores the rows.  For a
+	 * GTT, RelationSetNewRelfilenumber leaves the shared pg_class row alone
+	 * and changes only the session-local storage mapping, so the catalog
+	 * relfilenode that other sessions derive their storage paths from is
+	 * unaffected.
+	 *
+	 * The indexes cannot go through reindex_relation (REINDEX is disallowed
+	 * for GTTs); instead swap each index's session storage for an empty file
+	 * too and let GttBuildIndexIfNeeded rebuild it on next access.  (Opening
+	 * an index here may lazily build it from the already-swapped heap before
+	 * we swap the index file; that wastes a little work but is rollback-safe,
+	 * because the abort path clears index_built for indexes built in the
+	 * aborted transaction after restoring the swapped-out mapping.)
+	 */
+	RelationSetNewRelfilenumber(rel, rel->rd_rel->relpersistence);
+
+	indexoids = RelationGetIndexList(rel);
+	foreach(ind, indexoids)
+	{
+		Relation	idxrel = relation_open(lfirst_oid(ind),
+										   AccessExclusiveLock);
+
+		/* unmaterialized per-session storage holds nothing to truncate */
+		if (GttHasSessionStorage(RelationGetRelid(idxrel)))
+			RelationSetNewRelfilenumber(idxrel,
+										idxrel->rd_rel->relpersistence);
+		relation_close(idxrel, NoLock);
+	}
+	list_free(indexoids);
+
+	/* The same for the toast table and its index, if any */
+	toast_relid = rel->rd_rel->reltoastrelid;
+	if (OidIsValid(toast_relid) && GttHasSessionStorage(toast_relid))
+	{
+		Relation	toastrel = relation_open(toast_relid,
+											 AccessExclusiveLock);
+
+		RelationSetNewRelfilenumber(toastrel,
+									toastrel->rd_rel->relpersistence);
+
+		indexoids = RelationGetIndexList(toastrel);
+		foreach(ind, indexoids)
+		{
+			Relation	idxrel = relation_open(lfirst_oid(ind),
+											   AccessExclusiveLock);
+
+			if (GttHasSessionStorage(RelationGetRelid(idxrel)))
+				RelationSetNewRelfilenumber(idxrel,
+											idxrel->rd_rel->relpersistence);
+			relation_close(idxrel, NoLock);
+		}
+		list_free(indexoids);
+		table_close(toastrel, NoLock);
+	}
+}
+
+/*
  * ExecuteTruncate
  *		Executes a TRUNCATE command.
  *
@@ -2314,9 +2406,19 @@ ExecuteTruncateGuts(List *explicit_rels,
 		 * a new relfilenumber in the current (sub)transaction, then we can
 		 * just truncate it in-place, because a rollback would cause the whole
 		 * table or the current physical file to be thrown away anyway.
+		 *
+		 * Global temporary tables always go through the session-local swap:
+		 * the in-place path (heap_truncate_one_rel) assumes the relation
+		 * tree's files all exist, but a GTT's toast relation or indexes may
+		 * be unmaterialized -- and a same-transaction TRUNCATE or CREATE
+		 * (which is how rd_newRelfilelocatorSubid/rd_createSubid get set
+		 * here) makes that state likely rather than exotic.
+		 * GttTruncateInSession skips unmaterialized members individually.
 		 */
-		if (rel->rd_createSubid == mySubid ||
-			rel->rd_newRelfilelocatorSubid == mySubid)
+		if (RelationIsGlobalTemp(rel))
+			GttTruncateInSession(rel);
+		else if (rel->rd_createSubid == mySubid ||
+				 rel->rd_newRelfilelocatorSubid == mySubid)
 		{
 			/* Immediate, non-rollbackable truncation is OK */
 			heap_truncate_one_rel(rel);
