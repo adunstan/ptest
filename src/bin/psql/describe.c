@@ -2138,6 +2138,9 @@ describeOneTableDetails(const char *schemaname,
 			if (tableinfo.relpersistence == RELPERSISTENCE_UNLOGGED)
 				printfPQExpBuffer(&title, _("Unlogged table \"%s.%s\""),
 								  schemaname, relationname);
+			else if (tableinfo.relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+				printfPQExpBuffer(&title, _("Global temporary table \"%s.%s\""),
+								  schemaname, relationname);
 			else
 				printfPQExpBuffer(&title, _("Table \"%s.%s\""),
 								  schemaname, relationname);
@@ -2153,6 +2156,9 @@ describeOneTableDetails(const char *schemaname,
 		case RELKIND_INDEX:
 			if (tableinfo.relpersistence == RELPERSISTENCE_UNLOGGED)
 				printfPQExpBuffer(&title, _("Unlogged index \"%s.%s\""),
+								  schemaname, relationname);
+			else if (tableinfo.relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+				printfPQExpBuffer(&title, _("Global temporary index \"%s.%s\""),
 								  schemaname, relationname);
 			else
 				printfPQExpBuffer(&title, _("Index \"%s.%s\""),

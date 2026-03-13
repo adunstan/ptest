@@ -92,7 +92,10 @@ check_publication_add_relation(PublicationRelInfo *pri)
 				 errmsg(errormsg, relname),
 				 errdetail("This operation is not supported for system tables.")));
 
-	/* UNLOGGED and TEMP relations cannot be part of publication. */
+	/*
+	 * UNLOGGED, TEMP, and GLOBAL TEMP relations cannot be part of
+	 * publication.
+	 */
 	if (targetrel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -103,6 +106,11 @@ check_publication_add_relation(PublicationRelInfo *pri)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg(errormsg, relname),
 				 errdetail("This operation is not supported for unlogged tables.")));
+	else if (RelationIsGlobalTemp(targetrel))
+		ereport(ERROR,
+				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				errmsg(errormsg, RelationGetRelationName(targetrel)),
+				errdetail("This operation is not supported for global temporary tables."));
 }
 
 /*
