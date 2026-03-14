@@ -70,7 +70,9 @@ DISCARD { ALL | PLANS | SEQUENCES | TEMPORARY | TEMP }
     <term><literal>TEMPORARY</literal> or <literal>TEMP</literal></term>
     <listitem>
      <para>
-      Drops all temporary tables created in the current session.
+      Drops all temporary tables created in the current session, and
+      clears the current session's data in all global temporary tables
+      (resetting any global temporary sequences to their start values).
      </para>
     </listitem>
    </varlistentry>

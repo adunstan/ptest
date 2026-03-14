@@ -10909,6 +10909,39 @@ SET XML OPTION { DOCUMENT | CONTENT };
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-global-temp-xid-warn-margin" xreflabel="global_temp_xid_warn_margin">
+      <term><varname>global_temp_xid_warn_margin</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>global_temp_xid_warn_margin</varname></primary>
+       <secondary>configuration parameter</secondary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        The data in a <link linkend="sql-createtable-global-temporary">global
+        temporary table</link> is session-local and is not frozen by the
+        autovacuum daemon, so its oldest rows can age toward the point to
+        which the commit log has been truncated; once a row predates that
+        point the owning session can no longer read it, and to avoid
+        returning wrong results an access to the table is refused with an
+        error.  Running <link linkend="sql-vacuum"><command>VACUUM</command></link>
+        on the table freezes the session's data in place and prevents this.
+        This parameter sets how many transactions of head room before that
+        horizon a <emphasis>warning</emphasis> is first issued, giving a
+        long-lived session advance notice to <command>VACUUM</command> the
+        table (or, failing that, <command>TRUNCATE</command> it or reconnect).
+        If this value is zero, no warning is issued; the hard error is
+        unaffected.  The default is 100 million transactions.
+       </para>
+       <para>
+        The warning is suppressed unless the cluster's commit-log history is
+        longer than this value, so it does not fire on freshly written data.
+        For more information on wraparound see
+        <xref linkend="vacuum-for-wraparound"/>.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-createrole-self-grant" xreflabel="createrole_self_grant">
       <term><varname>createrole_self_grant</varname> (<type>string</type>)
       <indexterm>

@@ -118,6 +118,11 @@ test: json jsonb json_encoding jsonpath jsonpath_encoding jsonb_jsonpath sqljson
 test: plancache limit plpgsql copy2 temp domain rangefuncs prepare conversion truncate alter_table sequence polymorphism rowtypes returning largeobject with xml
 
 # ----------
+# global_temp does reconnects like temp, run it separately
+# ----------
+test: global_temp
+
+# ----------
 # Another group of parallel tests
 #
 # The stats test resets stats, so nothing else needing stats access can be in

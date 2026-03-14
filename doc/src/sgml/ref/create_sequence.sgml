@@ -21,7 +21,7 @@ PostgreSQL documentation
 
  <refsynopsisdiv>
 <synopsis>
-CREATE [ { TEMPORARY | TEMP } | UNLOGGED ] SEQUENCE [ IF NOT EXISTS ] <replaceable class="parameter">name</replaceable>
+CREATE [ [ GLOBAL | LOCAL ] { TEMPORARY | TEMP } | UNLOGGED ] SEQUENCE [ IF NOT EXISTS ] <replaceable class="parameter">name</replaceable>
     [ AS <replaceable class="parameter">data_type</replaceable> ]
     [ INCREMENT [ BY ] <replaceable class="parameter">increment</replaceable> ]
     [ MINVALUE <replaceable class="parameter">minvalue</replaceable> | NO MINVALUE ] [ MAXVALUE <replaceable class="parameter">maxvalue</replaceable> | NO MAXVALUE ]
@@ -90,6 +90,21 @@ SELECT * FROM <replaceable>name</replaceable>;
       permanent sequences with the same name are not visible (in this
       session) while the temporary sequence exists, unless they are
       referenced with schema-qualified names.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><literal>GLOBAL TEMPORARY</literal> or <literal>GLOBAL TEMP</literal></term>
+    <listitem>
+     <para>
+      If specified, the sequence is created as a global temporary
+      sequence.  The sequence definition is persistent across sessions,
+      but each session has its own independent counter that starts at
+      the <literal>START</literal> value on first use.  Values allocated
+      by <function>nextval</function> in one session are invisible to
+      other sessions.  See <xref linkend="sql-createtable-global-temporary"/>
+      for further discussion of global temporary objects.
      </para>
     </listitem>
    </varlistentry>

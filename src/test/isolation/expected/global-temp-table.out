@@ -1,0 +1,125 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_insert s2_insert s1_select s2_select
+step s1_insert: INSERT INTO gtt_iso VALUES (1), (2), (3);
+step s2_insert: INSERT INTO gtt_iso VALUES (10), (20), (30);
+step s1_select: SELECT a FROM gtt_iso ORDER BY a;
+a
+-
+1
+2
+3
+(3 rows)
+
+step s2_select: SELECT a FROM gtt_iso ORDER BY a;
+ a
+--
+10
+20
+30
+(3 rows)
+
+
+starting permutation: s1_ocdr_xact s2_ocdr_xact s1_ocdr_select s2_ocdr_select
+step s1_ocdr_xact: BEGIN; INSERT INTO gtt_ocdr VALUES (1), (2); COMMIT;
+step s2_ocdr_xact: BEGIN; INSERT INTO gtt_ocdr VALUES (10), (20); COMMIT;
+step s1_ocdr_select: SELECT x FROM gtt_ocdr ORDER BY x;
+x
+-
+(0 rows)
+
+step s2_ocdr_select: SELECT x FROM gtt_ocdr ORDER BY x;
+x
+-
+(0 rows)
+
+
+starting permutation: s1_ocdr_analyze s1_ocdr_stats_in s1_ocdr_commit s1_ocdr_stats_out s1_ocdr_select
+step s1_ocdr_analyze: BEGIN; INSERT INTO gtt_ocdr VALUES (5), (6), (7);
+                          ANALYZE gtt_ocdr;
+step s1_ocdr_stats_in: SELECT count(*) AS in_xact_stats
+                          FROM pg_gtt_relstats()
+                          WHERE table_name = 'gtt_ocdr';
+in_xact_stats
+-------------
+            1
+(1 row)
+
+step s1_ocdr_commit: COMMIT;
+step s1_ocdr_stats_out: SELECT count(*) AS post_commit_stats
+                          FROM pg_gtt_relstats()
+                          WHERE table_name = 'gtt_ocdr';
+post_commit_stats
+-----------------
+                0
+(1 row)
+
+step s1_ocdr_select: SELECT x FROM gtt_ocdr ORDER BY x;
+x
+-
+(0 rows)
+
+
+starting permutation: s1_create_drop s1_begin s1_access_drop s2_drop s1_rollback
+step s1_create_drop: CREATE GLOBAL TEMPORARY TABLE gtt_ddl (x int);
+step s1_begin: BEGIN;
+step s1_access_drop: INSERT INTO gtt_ddl VALUES (1);
+step s2_drop: DROP TABLE gtt_ddl; <waiting ...>
+step s1_rollback: ROLLBACK;
+step s2_drop: <... completed>
+
+starting permutation: s1_create_alter s1_begin s1_access_alter s2_alter s1_rollback
+step s1_create_alter: CREATE GLOBAL TEMPORARY TABLE gtt_alter (a int);
+step s1_begin: BEGIN;
+step s1_access_alter: INSERT INTO gtt_alter VALUES (1), (NULL);
+step s2_alter: ALTER TABLE gtt_alter ALTER COLUMN a SET NOT NULL; <waiting ...>
+step s1_rollback: ROLLBACK;
+step s2_alter: <... completed>
+
+starting permutation: s1_create_idx s1_begin s1_access_idx s2_create_idx s1_rollback
+step s1_create_idx: CREATE GLOBAL TEMPORARY TABLE gtt_idx (a int);
+step s1_begin: BEGIN;
+step s1_access_idx: INSERT INTO gtt_idx VALUES (1), (1);
+step s2_create_idx: CREATE UNIQUE INDEX ON gtt_idx (a); <waiting ...>
+step s1_rollback: ROLLBACK;
+step s2_create_idx: <... completed>
+
+starting permutation: s1_create_drop_c s1_insert_drop_c s2_drop_c
+step s1_create_drop_c: CREATE GLOBAL TEMPORARY TABLE gtt_ddl_c (x int);
+step s1_insert_drop_c: INSERT INTO gtt_ddl_c VALUES (1);
+step s2_drop_c: DROP TABLE gtt_ddl_c;
+ERROR:  cannot drop global temporary table: another session has live per-session data
+
+starting permutation: s1_create_lazy s1_explain_lazy s1_select_lazy s2_alter_lazy s2_drop_lazy
+step s1_create_lazy: CREATE GLOBAL TEMPORARY TABLE gtt_lazy (a int);
+step s1_explain_lazy: EXPLAIN (COSTS OFF) SELECT * FROM gtt_lazy;
+QUERY PLAN          
+--------------------
+Seq Scan on gtt_lazy
+(1 row)
+
+step s1_select_lazy: SELECT count(*) FROM gtt_lazy;
+count
+-----
+    0
+(1 row)
+
+step s2_alter_lazy: ALTER TABLE gtt_lazy ADD COLUMN b int;
+step s2_drop_lazy: DROP TABLE gtt_lazy;
+
+starting permutation: s1_create_disc s1_insert_disc s1_discard s2_drop_disc
+step s1_create_disc: CREATE GLOBAL TEMPORARY TABLE gtt_disc_iso (a int);
+step s1_insert_disc: INSERT INTO gtt_disc_iso VALUES (1);
+step s1_discard: DISCARD ALL;
+step s2_drop_disc: DROP TABLE gtt_disc_iso;
+
+starting permutation: s1_create_idxscan s1_scan_idxscan s2_drop_idxscan
+step s1_create_idxscan: CREATE GLOBAL TEMPORARY TABLE gtt_idxscan (a int PRIMARY KEY);
+step s1_scan_idxscan: SET enable_seqscan = off;
+                        SELECT * FROM gtt_idxscan WHERE a = 1;
+a
+-
+(0 rows)
+
+step s2_drop_idxscan: DROP TABLE gtt_idxscan;
+ERROR:  cannot drop global temporary table: another session has live per-session data
