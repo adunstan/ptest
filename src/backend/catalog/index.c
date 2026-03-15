@@ -2343,6 +2343,16 @@ index_drop(Oid indexId, bool concurrent, bool concurrent_lock_mode)
 	if (RELKIND_HAS_STORAGE(userIndexRelation->rd_rel->relkind))
 		RelationDropStorage(userIndexRelation);
 
+	/*
+	 * For a GTT index, also retire this session's storage-map entry (and its
+	 * registry row) at commit, exactly as heap_drop_with_catalog does for
+	 * tables.  Without this the entry would linger with storage_created set
+	 * but no file behind it, tripping any later pass that walks materialized
+	 * entries.
+	 */
+	if (RelationIsGlobalTemp(userIndexRelation))
+		GttScheduleDropSessionStorage(indexId);
+
 	/* ensure that stats are dropped if transaction commits */
 	pgstat_drop_relation(userIndexRelation);
 
@@ -2881,6 +2891,18 @@ index_update_stats(Relation rel,
 	}
 
 	/*
+	 * For a global temporary table, the page/tuple counts describe this
+	 * session's private data and must never be written to the shared pg_class
+	 * row, which is common to all sessions (cf. vac_update_relstats).  Just
+	 * drop them: per-session statistics are established by ANALYZE, and until
+	 * then the planner estimates from the session storage's actual size, as
+	 * for any fresh table.  relhasindex is a property of the shared catalog
+	 * definition, so fall through to update it below.
+	 */
+	if (RelationIsGlobalTemp(rel))
+		update_stats = false;
+
+	/*
 	 * Finish I/O and visibility map buffer locks before
 	 * systable_inplace_update_begin() locks the pg_class buffer.  The rd_rel
 	 * we modify may differ from rel->rd_rel due to e.g. commit of concurrent
@@ -3037,6 +3059,36 @@ index_build(Relation heapRelation,
 	Assert(indexRelation->rd_indam);
 	Assert(indexRelation->rd_indam->ambuild);
 	Assert(indexRelation->rd_indam->ambuildempty);
+
+	/*
+	 * A GTT index's per-session storage is created lazily.  If the parent
+	 * heap has no per-session storage yet, defer the physical build entirely:
+	 * there is nothing to index, and materializing the index now would let a
+	 * later transaction's rollback strand its entries (the heap file is
+	 * unlinked on abort, but an index file committed earlier is not -- though
+	 * gtt_truncate_dependents also backstops that case). The catalog work has
+	 * already happened; the per-session structure is built when the heap
+	 * materializes, or at the first index scan. Otherwise (heap has storage),
+	 * materialize the index and build for real -- covering CREATE INDEX on a
+	 * populated GTT and the in-place truncation of a same-transaction-created
+	 * GTT.
+	 */
+	if (RelationIsGlobalTemp(indexRelation))
+	{
+		if (!GttHasSessionStorage(RelationGetRelid(heapRelation)))
+		{
+			/*
+			 * Even a deferred build must mark the shared catalog: without
+			 * relhasindex the planner never looks at pg_index, in every
+			 * session.  (index_update_stats writes no page/tuple counts for a
+			 * GTT; relhasindex is shared-definition state.)
+			 */
+			GttMarkIndexBuildDeferred(indexRelation);
+			index_update_stats(heapRelation, true, -1);
+			return;
+		}
+		GttEnsureSessionStorage(indexRelation);
+	}
 
 	/*
 	 * Determine worker process details for parallel CREATE INDEX.  Currently,

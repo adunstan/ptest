@@ -12693,4 +12693,32 @@
   proname => 'hashoid8extended', prorettype => 'int8',
   proargtypes => 'oid8 int8', prosrc => 'hashoid8extended' },
 
+# Global temporary table per-session statistics
+# NB: These are redefined in system_functions.sql to add a DEFAULT NULL,
+# which can't be done here (regclass isn't in the bootstrap TypInfo, so
+# InsertOneProargdefaultsValue can't construct a Const for the default).
+{ oid => '9916',
+  descr => 'per-session relation statistics for global temporary tables',
+  proname => 'pg_gtt_relstats', prorows => '10', proretset => 't',
+  provolatile => 'v', proisstrict => 'f', prorettype => 'record',
+  proargtypes => 'regclass',
+  proallargtypes => '{regclass,oid,text,int4,float4,int4}',
+  proargmodes => '{i,o,o,o,o,o}',
+  proargnames => '{relid,table_oid,table_name,relpages,reltuples,relallvisible}',
+  prosrc => 'pg_gtt_relstats' },
+{ oid => '9917',
+  descr => 'per-session column statistics for global temporary tables',
+  proname => 'pg_gtt_colstats', prorows => '10', proretset => 't',
+  provolatile => 'v', proisstrict => 'f', prorettype => 'record',
+  proargtypes => 'regclass',
+  proallargtypes => '{regclass,oid,text,int2,text,bool,float4,int4,float4,text,_float4,text,float4}',
+  proargmodes => '{i,o,o,o,o,o,o,o,o,o,o,o,o}',
+  proargnames => '{relid,table_oid,table_name,attnum,attname,inherited,null_frac,avg_width,n_distinct,most_common_vals,most_common_freqs,histogram_bounds,correlation}',
+  prosrc => 'pg_gtt_colstats' },
+{ oid => '9918',
+  descr => 'discard per-session statistics for global temporary tables',
+  proname => 'pg_gtt_clear_stats', provolatile => 'v', proisstrict => 'f',
+  prorettype => 'void', proargtypes => 'regclass',
+  prosrc => 'pg_gtt_clear_stats' },
+
 ]

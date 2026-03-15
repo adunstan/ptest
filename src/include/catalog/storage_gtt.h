@@ -28,4 +28,20 @@ extern void GttPrepareIndexAccess(Relation indexRelation);
 extern void PreCommit_gtt_on_commit(void);
 extern void GttResetAllSessionData(void);
 
+/* Per-session relation-level statistics for planner */
+extern bool GttGetSessionStats(Oid relid, BlockNumber *relpages,
+							   double *reltuples, BlockNumber *relallvisible);
+extern void GttUpdateSessionStats(Oid relid, BlockNumber relpages,
+								  double reltuples, BlockNumber relallvisible);
+extern void GttResetSessionStats(Oid relid);
+
+/* Per-session column-level statistics for planner */
+extern void GttStoreSessionColumnStats(Oid relid, AttrNumber attnum, bool inh,
+									   HeapTuple tuple);
+extern HeapTuple GttSearchColumnStats(Oid relid, AttrNumber attnum, bool inh);
+extern void GttReleaseColumnStats(HeapTuple tuple);
+extern HeapTuple SearchStats(Oid relid, AttrNumber attnum, bool inh,
+							 bool include_gtt,
+							 void (**freefunc) (HeapTuple));
+
 #endif							/* STORAGE_GTT_H */

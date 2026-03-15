@@ -28,7 +28,9 @@
 #include "catalog/catalog.h"
 #include "catalog/heap.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_proc.h"
+#include "catalog/storage_gtt.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_statistic_ext_data.h"
 #include "foreign/fdwapi.h"
@@ -1310,6 +1312,64 @@ estimate_rel_size(Relation rel, int32 *attr_widths,
 	double		reltuples;
 	BlockNumber relallvisible;
 	double		density;
+
+	/*
+	 * For global temporary tables, use per-session statistics if available.
+	 * Each session has its own private GTT data, so the shared pg_class
+	 * statistics are not meaningful.  Per-session stats are populated by
+	 * ANALYZE and stored in the backend-local GTT storage hash.
+	 *
+	 * For both heap tables and indexes, we use the actual per-session page
+	 * count and the per-session tuple density from ANALYZE.  If ANALYZE
+	 * hasn't been run yet, we skip the "never vacuumed" minimum-10-pages
+	 * heuristic (which would overestimate, since GTTs genuinely start empty)
+	 * and fall through to the normal estimation paths.
+	 */
+	if (RelationIsGlobalTemp(rel))
+	{
+		BlockNumber sess_pages;
+		double		sess_tuples;
+		BlockNumber sess_allvisible;
+
+		if (GttGetSessionStats(RelationGetRelid(rel),
+							   &sess_pages, &sess_tuples, &sess_allvisible))
+		{
+			curpages = RelationGetNumberOfBlocks(rel);
+			*pages = curpages;
+
+			if (curpages == 0)
+			{
+				*tuples = 0;
+				*allvisfrac = 0;
+				return;
+			}
+
+			/* Use per-session tuple density to estimate current tuples */
+			if (sess_tuples >= 0 && sess_pages > 0)
+				density = sess_tuples / (double) sess_pages;
+			else
+			{
+				int32		tuple_width;
+
+				tuple_width = get_rel_data_width(rel, attr_widths);
+				tuple_width += MAXALIGN(SizeofHeapTupleHeader);
+				tuple_width += sizeof(ItemIdData);
+				density = (BLCKSZ - SizeOfPageHeaderData) / tuple_width;
+			}
+			*tuples = rint(density * (double) curpages);
+
+			if (sess_allvisible == 0 || curpages <= 0)
+				*allvisfrac = 0;
+			else if ((double) sess_allvisible >= curpages)
+				*allvisfrac = 1;
+			else
+				*allvisfrac = (double) sess_allvisible / curpages;
+
+			return;
+		}
+
+		/* No per-session stats yet; fall through to normal estimation. */
+	}
 
 	if (RELKIND_HAS_TABLE_AM(rel->rd_rel->relkind))
 	{

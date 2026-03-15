@@ -22,6 +22,7 @@
 #include "postgres.h"
 
 #include "access/amapi.h"
+#include "access/htup_details.h"
 #include "access/parallel.h"
 #include "access/relation.h"
 #include "access/table.h"
@@ -29,24 +30,33 @@
 #include "access/xact.h"
 #include "catalog/heap.h"
 #include "catalog/index.h"
+#include "catalog/pg_attribute.h"
+#include "catalog/pg_statistic.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage.h"
 #include "catalog/storage_gtt.h"
 #include "commands/sequence.h"
 #include "commands/tablecmds.h"
 #include "common/hashfn.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/pg_list.h"
 #include "storage/ipc.h"
 #include "storage/bufmgr.h"
 #include "storage/procnumber.h"
 #include "storage/smgr.h"
+#include "utils/acl.h"
+#include "utils/array.h"
+#include "utils/fmgroids.h"
+#include "utils/builtins.h"
+#include "utils/tuplestore.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
+#include "utils/syscache.h"
 
 /*
  * Per-session state for a single global temporary table.
@@ -58,6 +68,7 @@
  *     commit)
  *   - storage_subid: subxact that most recently called RelationCreateStorage
  *   - index_subid: subxact that built the index for this session
+ *   - stats_subid: subxact that last wrote per-session statistics
  * On subxact or xact abort of a given subid, the corresponding state is
  * reverted.  On subxact commit, the subid is reparented.  See
  * gtt_subxact_callback / gtt_xact_callback.
@@ -80,6 +91,13 @@ typedef struct GttStorageEntry
 	SubTransactionId create_subid;	/* subxact that added this entry */
 	SubTransactionId storage_subid; /* subxact that created current storage */
 	SubTransactionId index_subid;	/* subxact that built the index */
+	SubTransactionId stats_subid;	/* subxact that last wrote session stats */
+
+	/* Per-session relation statistics (set by ANALYZE) */
+	bool		stats_valid;	/* has ANALYZE been run in this session? */
+	BlockNumber relpages;		/* per-session page count */
+	float4		reltuples;		/* per-session tuple count */
+	BlockNumber relallvisible;	/* per-session all-visible pages */
 } GttStorageEntry;
 
 /* Backend-local hash table: GTT OID -> GttStorageEntry */
@@ -110,10 +128,43 @@ typedef struct GttSwapUndo
 	RelFileNumber prev_relnumber;	/* mapping to restore on abort */
 	bool		prev_index_built;
 	bool		prev_build_deferred;
+	bool		prev_stats_valid;
+	BlockNumber prev_relpages;
+	float4		prev_reltuples;
+	BlockNumber prev_relallvisible;
 } GttSwapUndo;
 
 /* List of GttSwapUndo *, newest first, allocated in TopMemoryContext */
 static List *gtt_swap_undo = NIL;
+
+/*
+ * Per-session column-level statistics for global temporary tables.
+ *
+ * Column stats (histograms, MCVs, distinct counts, etc.) are stored as
+ * pg_statistic-format HeapTuples in a separate backend-local hash table,
+ * keyed by (relid, attnum, inh).  This parallels the relation-level stats
+ * (relpages/reltuples) stored in GttStorageEntry above.
+ *
+ * The key has trailing alignment padding that HASH_BLOBS hashes verbatim,
+ * so all key instances must be zero-initialized before the fields are set.
+ * Always build keys via init_colstats_key() rather than by hand.
+ */
+typedef struct GttColStatsKey
+{
+	Oid			relid;			/* relation OID */
+	AttrNumber	attnum;			/* attribute number */
+	bool		inh;			/* include inheritance children? */
+} GttColStatsKey;
+
+typedef struct GttColStatsEntry
+{
+	GttColStatsKey key;			/* hash key — must be first */
+	HeapTuple	statsTuple;		/* pg_statistic-format tuple in
+								 * TopMemoryContext */
+} GttColStatsEntry;
+
+/* Backend-local hash table: (relid, attnum, inh) -> GttColStatsEntry */
+static HTAB *gtt_colstats_hash = NULL;
 
 /* Guard against recursive index builds */
 static bool gtt_building_index = false;
@@ -121,6 +172,11 @@ static bool gtt_building_index = false;
 /* Local function prototypes */
 static void gtt_session_cleanup(int code, Datum arg);
 static void ensure_gtt_hash(void);
+static void ensure_gtt_colstats_hash(void);
+static void init_colstats_key(GttColStatsKey *key, Oid relid,
+							  AttrNumber attnum, bool inh);
+static void gtt_reset_colstats_for_rel(Oid relid);
+static char *format_stats_values_as_text(AttStatsSlot *sslot);
 static void gtt_xact_callback(XactEvent event, void *arg);
 static void gtt_subxact_callback(SubXactEvent event,
 								 SubTransactionId mySubid,
@@ -164,6 +220,48 @@ ensure_gtt_hash(void)
 	before_shmem_exit(gtt_session_cleanup, (Datum) 0);
 	RegisterXactCallback(gtt_xact_callback, NULL);
 	RegisterSubXactCallback(gtt_subxact_callback, NULL);
+}
+
+/*
+ * ensure_gtt_colstats_hash
+ *		Create the backend-local column stats hash table on first use.
+ *
+ * This is separate from ensure_gtt_hash() so the column stats hash is only
+ * created when actually needed (during ANALYZE or planner lookup).
+ */
+static void
+ensure_gtt_colstats_hash(void)
+{
+	HASHCTL		hashctl;
+
+	if (gtt_colstats_hash != NULL)
+		return;
+
+	hashctl.keysize = sizeof(GttColStatsKey);
+	hashctl.entrysize = sizeof(GttColStatsEntry);
+	hashctl.hcxt = TopMemoryContext;
+	gtt_colstats_hash = hash_create("GTT column stats hash",
+									64, /* initial size */
+									&hashctl,
+									HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+/*
+ * init_colstats_key
+ *		Build a GttColStatsKey with deterministic byte contents.
+ *
+ * HASH_BLOBS hashes the key byte-for-byte, including any trailing
+ * alignment padding the compiler may insert after the last field.
+ * Zero the whole struct first so equivalent (relid, attnum, inh) triples
+ * always produce the same hash.
+ */
+static void
+init_colstats_key(GttColStatsKey *key, Oid relid, AttrNumber attnum, bool inh)
+{
+	memset(key, 0, sizeof(*key));
+	key->relid = relid;
+	key->attnum = attnum;
+	key->inh = inh;
 }
 
 /*
@@ -334,8 +432,20 @@ gtt_init_entry(GttStorageEntry *entry, Relation relation)
 	gtt_xact_state_dirty = true;
 	entry->storage_subid = InvalidSubTransactionId;
 	entry->index_subid = InvalidSubTransactionId;
+	entry->stats_subid = InvalidSubTransactionId;
+	entry->stats_valid = false;
+	entry->relpages = 0;
+	entry->reltuples = 0;
+	entry->relallvisible = 0;
 	entry->on_commit_delete = false;
 	entry->toast_relid = InvalidOid;
+
+	/*
+	 * Discard any column statistics recorded under this OID: when the entry
+	 * is being refreshed after OID recycling, they describe a different,
+	 * dropped relation.  (For a brand-new entry this is a no-op.)
+	 */
+	gtt_reset_colstats_for_rel(entry->relid);
 }
 
 /*
@@ -458,6 +568,10 @@ GttSetNewSessionRelfilenumber(Relation relation, RelFileNumber newrelfilenumber)
 	undo->prev_relnumber = entry->locator.relNumber;
 	undo->prev_index_built = entry->index_built;
 	undo->prev_build_deferred = entry->build_deferred;
+	undo->prev_stats_valid = entry->stats_valid;
+	undo->prev_relpages = entry->relpages;
+	undo->prev_reltuples = entry->reltuples;
+	undo->prev_relallvisible = entry->relallvisible;
 	gtt_swap_undo = lcons(undo, gtt_swap_undo);
 	MemoryContextSwitchTo(oldcxt);
 
@@ -466,7 +580,9 @@ GttSetNewSessionRelfilenumber(Relation relation, RelFileNumber newrelfilenumber)
 
 	/*
 	 * The new file is empty: indexes must be lazily rebuilt on next access
-	 * (GttBuildIndexIfNeeded).
+	 * (GttBuildIndexIfNeeded), and previous ANALYZE results no longer apply.
+	 * Column-level statistics are left alone, matching the behavior of
+	 * TRUNCATE on regular tables, which does not clear pg_statistic.
 	 */
 	if (entry->is_index)
 	{
@@ -482,6 +598,10 @@ GttSetNewSessionRelfilenumber(Relation relation, RelFileNumber newrelfilenumber)
 		if (relation->rd_createSubid != InvalidSubTransactionId)
 			entry->build_deferred = true;
 	}
+	entry->stats_valid = false;
+	entry->relpages = 0;
+	entry->reltuples = 0;
+	entry->relallvisible = 0;
 
 	/* Point the open relcache entry at the new storage. */
 	relation->rd_locator = entry->locator;
@@ -509,6 +629,10 @@ gtt_swap_undo_apply(GttSwapUndo *undo)
 	entry->locator.relNumber = undo->prev_relnumber;
 	entry->index_built = undo->prev_index_built;
 	entry->build_deferred = undo->prev_build_deferred;
+	entry->stats_valid = undo->prev_stats_valid;
+	entry->relpages = undo->prev_relpages;
+	entry->reltuples = undo->prev_reltuples;
+	entry->relallvisible = undo->prev_relallvisible;
 
 	/*
 	 * Refresh the relcache entry so rd_locator points back at the surviving
@@ -576,6 +700,9 @@ static void
 gtt_remove_entry(GttStorageEntry *entry)
 {
 	Oid			relid = entry->relid;
+
+	/* Discard any per-session column statistics for this relation */
+	gtt_reset_colstats_for_rel(relid);
 
 	hash_search(gtt_storage_hash, &relid, HASH_REMOVE, NULL);
 }
@@ -750,6 +877,7 @@ gtt_xact_callback(XactEvent event, void *arg)
 				entry->create_subid = InvalidSubTransactionId;
 				entry->storage_subid = InvalidSubTransactionId;
 				entry->index_subid = InvalidSubTransactionId;
+				entry->stats_subid = InvalidSubTransactionId;
 			}
 		}
 		else
@@ -779,6 +907,20 @@ gtt_xact_callback(XactEvent event, void *arg)
 				{
 					entry->index_built = false;
 					entry->index_subid = InvalidSubTransactionId;
+				}
+				if (entry->stats_subid != InvalidSubTransactionId)
+				{
+					/*
+					 * Session statistics written by the aborted transaction
+					 * describe rolled-back data; throw them away (column
+					 * stats too -- the previous tuples were freed when the
+					 * aborted ANALYZE replaced them, so there is nothing to
+					 * restore).  The planner falls back to size-based
+					 * estimation, which is right for the surviving state.
+					 */
+					entry->stats_valid = false;
+					entry->stats_subid = InvalidSubTransactionId;
+					gtt_reset_colstats_for_rel(entry->relid);
 				}
 				entry->drop_pending = false;
 			}
@@ -863,6 +1005,8 @@ gtt_subxact_callback(SubXactEvent event,
 				entry->storage_subid = parentSubid;
 			if (entry->index_subid == mySubid)
 				entry->index_subid = parentSubid;
+			if (entry->stats_subid == mySubid)
+				entry->stats_subid = parentSubid;
 		}
 		else					/* SUBXACT_EVENT_ABORT_SUB */
 		{
@@ -881,6 +1025,13 @@ gtt_subxact_callback(SubXactEvent event,
 			{
 				entry->index_built = false;
 				entry->index_subid = InvalidSubTransactionId;
+			}
+			if (entry->stats_subid == mySubid)
+			{
+				/* see gtt_xact_callback */
+				entry->stats_valid = false;
+				entry->stats_subid = InvalidSubTransactionId;
+				gtt_reset_colstats_for_rel(entry->relid);
 			}
 		}
 	}
@@ -1186,6 +1337,285 @@ GttPrepareIndexAccess(Relation indexRelation)
 }
 
 /*
+ * GttGetSessionStats
+ *		Retrieve per-session relation statistics for a GTT.
+ *
+ * Returns true if per-session statistics are available (i.e. ANALYZE has
+ * been run on this GTT in this session), filling in the output parameters.
+ * Returns false if no per-session stats exist, in which case the planner
+ * should fall back to default estimation.
+ */
+bool
+GttGetSessionStats(Oid relid, BlockNumber *relpages, double *reltuples,
+				   BlockNumber *relallvisible)
+{
+	GttStorageEntry *entry;
+
+	if (gtt_storage_hash == NULL)
+		return false;
+
+	entry = (GttStorageEntry *) hash_search(gtt_storage_hash,
+											&relid,
+											HASH_FIND,
+											NULL);
+	if (entry == NULL || !entry->stats_valid)
+		return false;
+
+	*relpages = entry->relpages;
+	*reltuples = (double) entry->reltuples;
+	*relallvisible = entry->relallvisible;
+	return true;
+}
+
+/*
+ * GttUpdateSessionStats
+ *		Store per-session relation statistics for a GTT.
+ *
+ * Called from ANALYZE to record relpages/reltuples/relallvisible in the
+ * per-session hash instead of writing to the shared pg_class row.
+ */
+void
+GttUpdateSessionStats(Oid relid, BlockNumber relpages, double reltuples,
+					  BlockNumber relallvisible)
+{
+	GttStorageEntry *entry;
+
+	if (gtt_storage_hash == NULL)
+		return;
+
+	entry = (GttStorageEntry *) hash_search(gtt_storage_hash,
+											&relid,
+											HASH_FIND,
+											NULL);
+	if (entry == NULL)
+		return;
+
+	entry->stats_valid = true;
+	entry->relpages = relpages;
+	entry->reltuples = (float4) reltuples;
+	entry->relallvisible = relallvisible;
+
+	/*
+	 * Unlike pg_class/pg_statistic writes, these survive a transaction abort
+	 * unless we act: remember the writing subxact so the abort paths can
+	 * invalidate stats that describe rolled-back data.
+	 */
+	entry->stats_subid = GetCurrentSubTransactionId();
+	gtt_xact_state_dirty = true;
+}
+
+/*
+ * GttResetSessionStats
+ *		Invalidate per-session stats for a GTT after TRUNCATE.
+ *
+ * After truncation, the previous ANALYZE statistics are no longer valid.
+ * The planner will fall back to default estimation based on actual page
+ * count until ANALYZE is run again.
+ */
+void
+GttResetSessionStats(Oid relid)
+{
+	GttStorageEntry *entry;
+
+	if (gtt_storage_hash == NULL)
+		return;
+
+	entry = (GttStorageEntry *) hash_search(gtt_storage_hash,
+											&relid,
+											HASH_FIND,
+											NULL);
+	if (entry != NULL)
+		entry->stats_valid = false;
+
+	/* Also clear any per-session column statistics */
+	gtt_reset_colstats_for_rel(relid);
+}
+
+/*
+ * GttStoreSessionColumnStats
+ *		Store a per-session column statistics tuple for a GTT.
+ *
+ * The tuple must be a pg_statistic-format HeapTuple allocated in
+ * TopMemoryContext.  If an entry already exists for this (relid, attnum, inh),
+ * the old tuple is freed and replaced.
+ */
+void
+GttStoreSessionColumnStats(Oid relid, AttrNumber attnum, bool inh,
+						   HeapTuple tuple)
+{
+	GttColStatsKey key;
+	GttColStatsEntry *entry;
+	GttStorageEntry *rel_entry;
+	bool		found;
+
+	ensure_gtt_colstats_hash();
+
+	init_colstats_key(&key, relid, attnum, inh);
+
+	entry = (GttColStatsEntry *) hash_search(gtt_colstats_hash,
+											 &key,
+											 HASH_ENTER,
+											 &found);
+	if (found && entry->statsTuple != NULL)
+		heap_freetuple(entry->statsTuple);
+
+	entry->statsTuple = tuple;
+
+	/*
+	 * Mark the relation-level entry so an abort of the writing (sub)xact
+	 * invalidates the column stats along with the relation stats; see
+	 * GttUpdateSessionStats.
+	 */
+	if (gtt_storage_hash != NULL)
+	{
+		rel_entry = (GttStorageEntry *) hash_search(gtt_storage_hash, &relid,
+													HASH_FIND, NULL);
+		if (rel_entry != NULL)
+		{
+			rel_entry->stats_subid = GetCurrentSubTransactionId();
+			gtt_xact_state_dirty = true;
+		}
+	}
+}
+
+/*
+ * GttSearchColumnStats
+ *		Look up per-session column statistics for a GTT column.
+ *
+ * Returns the stored pg_statistic-format HeapTuple, or NULL if no per-session
+ * stats exist for this column.  The caller must NOT free the returned tuple;
+ * it is owned by the hash table.
+ */
+HeapTuple
+GttSearchColumnStats(Oid relid, AttrNumber attnum, bool inh)
+{
+	GttColStatsKey key;
+	GttColStatsEntry *entry;
+
+	if (gtt_colstats_hash == NULL)
+		return NULL;
+
+	init_colstats_key(&key, relid, attnum, inh);
+
+	entry = (GttColStatsEntry *) hash_search(gtt_colstats_hash,
+											 &key,
+											 HASH_FIND,
+											 NULL);
+	if (entry != NULL)
+		return entry->statsTuple;
+
+	return NULL;
+}
+
+/*
+ * GttReleaseColumnStats
+ *		No-op freefunc for per-session GTT column statistics tuples.
+ *
+ * The tuple is owned by gtt_colstats_hash and must not be freed by the
+ * planner.  This function is used as the VariableStatData.freefunc callback.
+ */
+void
+GttReleaseColumnStats(HeapTuple tuple)
+{
+	/* No-op: tuple lives in gtt_colstats_hash in TopMemoryContext */
+}
+
+/*
+ * SearchStats
+ *		Look up column statistics, checking per-session GTT stats if requested.
+ *
+ * Checks the pg_statistic syscache first.  If include_gtt is true and no
+ * shared stats are found, falls back to per-session GTT statistics.
+ * Sets *freefunc to the appropriate release function for the returned tuple.
+ */
+HeapTuple
+SearchStats(Oid relid, AttrNumber attnum, bool inh,
+			bool include_gtt,
+			void (**freefunc) (HeapTuple))
+{
+	HeapTuple	tuple;
+
+	/*
+	 * Check the shared pg_statistic catalog first.  A GTT never has rows
+	 * there (ANALYZE diverts its stats to the per-session hash), so a
+	 * syscache hit settles the lookup without touching the GTT hash: once any
+	 * GTT has been ANALYZEd in this session, probing the hash first would
+	 * cost every planner stats lookup for ordinary analyzed tables a
+	 * guaranteed-miss hash search on this hot path.
+	 */
+	tuple = SearchSysCache3(STATRELATTINH,
+							ObjectIdGetDatum(relid),
+							Int16GetDatum(attnum),
+							BoolGetDatum(inh));
+	if (HeapTupleIsValid(tuple))
+	{
+		*freefunc = ReleaseSysCache;
+		return tuple;
+	}
+
+	/* No shared stats: per-session GTT stats, or no stats at all. */
+	if (include_gtt)
+	{
+		tuple = GttSearchColumnStats(relid, attnum, inh);
+		if (HeapTupleIsValid(tuple))
+		{
+			*freefunc = GttReleaseColumnStats;
+			return tuple;
+		}
+	}
+
+	*freefunc = ReleaseSysCache;
+	return NULL;
+}
+
+/*
+ * gtt_reset_colstats_for_rel
+ *		Remove all per-session column statistics for a given relation.
+ *
+ * Used when stats are invalidated (TRUNCATE, ON COMMIT DELETE ROWS, DROP).
+ */
+static void
+gtt_reset_colstats_for_rel(Oid relid)
+{
+	HASH_SEQ_STATUS status;
+	GttColStatsEntry *entry;
+	List	   *keys_to_remove = NIL;
+	ListCell   *lc;
+
+	if (gtt_colstats_hash == NULL)
+		return;
+
+	/*
+	 * Collect matching keys first; we can't remove hash entries during an
+	 * active hash_seq_search scan.
+	 */
+	hash_seq_init(&status, gtt_colstats_hash);
+	while ((entry = (GttColStatsEntry *) hash_seq_search(&status)) != NULL)
+	{
+		GttColStatsKey *keycopy;
+
+		if (entry->key.relid != relid)
+			continue;
+
+		keycopy = (GttColStatsKey *) palloc(sizeof(*keycopy));
+		*keycopy = entry->key;
+		keys_to_remove = lappend(keys_to_remove, keycopy);
+	}
+
+	foreach(lc, keys_to_remove)
+	{
+		GttColStatsKey *key = (GttColStatsKey *) lfirst(lc);
+
+		entry = (GttColStatsEntry *) hash_search(gtt_colstats_hash, key,
+												 HASH_REMOVE, NULL);
+		if (entry != NULL && entry->statsTuple != NULL)
+			heap_freetuple(entry->statsTuple);
+		pfree(key);
+	}
+	list_free(keys_to_remove);
+}
+
+/*
  * PreCommit_gtt_on_commit
  *		Truncate ON COMMIT DELETE ROWS GTTs at commit.
  *
@@ -1218,7 +1648,7 @@ PreCommit_gtt_on_commit(void)
 	if (!(MyXactFlags & XACT_FLAGS_ACCESSEDTEMPNAMESPACE))
 		return;
 
-	/* First pass: identify ON COMMIT DELETE ROWS heaps to truncate. */
+	/* First pass: reset heap entries and remember which heaps were wiped. */
 	hash_seq_init(&status, gtt_storage_hash);
 	while ((entry = (GttStorageEntry *) hash_seq_search(&status)) != NULL)
 	{
@@ -1239,6 +1669,7 @@ PreCommit_gtt_on_commit(void)
 						MAIN_FORKNUM) == 0)
 			continue;
 
+		entry->stats_valid = false;
 		heap_relids = lappend_oid(heap_relids, entry->relid);
 
 		/*
@@ -1281,6 +1712,10 @@ PreCommit_gtt_on_commit(void)
 		else if (list_member_oid(heap_relids, entry->relid))
 			gtt_truncate_smgr(entry);
 	}
+
+	/* Column stats live in a second hash; clear them for each truncated rel. */
+	foreach_oid(relid, heap_relids)
+		gtt_reset_colstats_for_rel(relid);
 
 	list_free(heap_relids);
 }
@@ -1372,6 +1807,13 @@ gtt_session_cleanup(int code, Datum arg)
 	HASH_SEQ_STATUS status;
 	GttStorageEntry *entry;
 
+	/*
+	 * The column-stats hash lives in TopMemoryContext and will be torn down
+	 * with the rest of process memory shortly after we return; nothing to do
+	 * here.  We only walk gtt_storage_hash because each entry owns
+	 * externally-visible resources (on-disk files and a session lock) that
+	 * must be released explicitly.
+	 */
 	if (gtt_storage_hash == NULL)
 		return;
 
@@ -1386,4 +1828,329 @@ gtt_session_cleanup(int code, Datum arg)
 			smgrdounlinkall(&srel, 1, false);
 		}
 	}
+}
+
+/*
+ * format_stats_values_as_text
+ *		Convert the values from an AttStatsSlot into a text representation.
+ *
+ * We build a PostgreSQL array of the slot's element type and return its
+ * array_out textual form.  That gives proper array-literal escaping for
+ * values containing commas, braces, double quotes, backslashes, etc.,
+ * matching what pg_stats produces via its anyarray columns.
+ */
+static char *
+format_stats_values_as_text(AttStatsSlot *sslot)
+{
+	ArrayType  *arr;
+	int16		typlen;
+	bool		typbyval;
+	char		typalign;
+
+	get_typlenbyvalalign(sslot->valuetype, &typlen, &typbyval, &typalign);
+	arr = construct_array(sslot->values, sslot->nvalues,
+						  sslot->valuetype, typlen, typbyval, typalign);
+
+	return OidOutputFunctionCall(F_ARRAY_OUT, PointerGetDatum(arr));
+}
+
+/*
+ * pg_gtt_relstats
+ *		Return per-session relation-level statistics for global temporary tables.
+ *
+ * If a regclass argument is provided, returns stats only for that table.
+ * If NULL (the default), returns stats for all GTTs with valid session stats.
+ */
+Datum
+pg_gtt_relstats(PG_FUNCTION_ARGS)
+{
+#define PG_GTT_SESSION_RELSTATS_COLS 5
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Oid			filter_relid = InvalidOid;
+	HASH_SEQ_STATUS status;
+	GttStorageEntry *entry;
+	Datum		values[PG_GTT_SESSION_RELSTATS_COLS];
+	bool		nulls[PG_GTT_SESSION_RELSTATS_COLS];
+
+	if (!PG_ARGISNULL(0))
+		filter_relid = PG_GETARG_OID(0);
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	if (gtt_storage_hash == NULL)
+		return (Datum) 0;
+
+	memset(nulls, 0, sizeof(nulls));
+
+	hash_seq_init(&status, gtt_storage_hash);
+	while ((entry = (GttStorageEntry *) hash_seq_search(&status)) != NULL)
+	{
+		char	   *relname;
+
+		if (!entry->stats_valid)
+			continue;
+		if (OidIsValid(filter_relid) && entry->relid != filter_relid)
+			continue;
+
+		/*
+		 * Respect SELECT privilege on the target relation so callers can't
+		 * inspect stats for relations they can't see.  Mirrors pg_stats.
+		 */
+		if (pg_class_aclcheck(entry->relid, GetUserId(), ACL_SELECT) != ACLCHECK_OK)
+			continue;
+
+		relname = get_rel_name(entry->relid);
+		if (relname == NULL)
+			continue;
+
+		values[0] = ObjectIdGetDatum(entry->relid);
+		values[1] = CStringGetTextDatum(relname);
+		values[2] = Int32GetDatum((int32) entry->relpages);
+		values[3] = Float4GetDatum(entry->reltuples);
+		values[4] = Int32GetDatum((int32) entry->relallvisible);
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+							 values, nulls);
+	}
+
+	return (Datum) 0;
+}
+
+/*
+ * pg_gtt_colstats
+ *		Return per-session column-level statistics for global temporary tables.
+ *
+ * Returns stats in a format similar to the pg_stats view: scalar stats
+ * (null_frac, avg_width, n_distinct), MCVs, histograms, and correlation.
+ * Array-typed values are converted to text representation.
+ *
+ * If a regclass argument is provided, returns stats only for that table.
+ * If NULL (the default), returns stats for all GTTs with column stats.
+ */
+Datum
+pg_gtt_colstats(PG_FUNCTION_ARGS)
+{
+#define PG_GTT_SESSION_COLSTATS_COLS 12
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Oid			filter_relid = InvalidOid;
+	HASH_SEQ_STATUS status;
+	GttColStatsEntry *csentry;
+
+	if (!PG_ARGISNULL(0))
+		filter_relid = PG_GETARG_OID(0);
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	if (gtt_colstats_hash == NULL)
+		return (Datum) 0;
+
+	hash_seq_init(&status, gtt_colstats_hash);
+	while ((csentry = (GttColStatsEntry *) hash_seq_search(&status)) != NULL)
+	{
+		HeapTuple	statstuple = csentry->statsTuple;
+		Form_pg_statistic stats;
+		char	   *relname;
+		char	   *attname;
+		int			mcv_slot;
+		int			hist_slot;
+		int			corr_slot;
+		int			k;
+		Datum		values[PG_GTT_SESSION_COLSTATS_COLS];
+		bool		nulls[PG_GTT_SESSION_COLSTATS_COLS];
+
+		if (statstuple == NULL)
+			continue;
+		if (OidIsValid(filter_relid) && csentry->key.relid != filter_relid)
+			continue;
+
+		/*
+		 * Require column-level SELECT privilege (or table-level) on the
+		 * attribute to see its stats, matching pg_stats behavior.
+		 */
+		if (pg_class_aclcheck(csentry->key.relid, GetUserId(),
+							  ACL_SELECT) != ACLCHECK_OK &&
+			pg_attribute_aclcheck(csentry->key.relid, csentry->key.attnum,
+								  GetUserId(), ACL_SELECT) != ACLCHECK_OK)
+			continue;
+
+		relname = get_rel_name(csentry->key.relid);
+		if (relname == NULL)
+			continue;
+
+		stats = (Form_pg_statistic) GETSTRUCT(statstuple);
+
+		/* Start with all nulls, then fill in non-null columns */
+		memset(nulls, true, sizeof(nulls));
+
+		values[0] = ObjectIdGetDatum(csentry->key.relid);
+		nulls[0] = false;
+		values[1] = CStringGetTextDatum(relname);
+		nulls[1] = false;
+		values[2] = Int16GetDatum(csentry->key.attnum);
+		nulls[2] = false;
+
+		attname = get_attname(csentry->key.relid, csentry->key.attnum, true);
+		if (attname != NULL)
+		{
+			values[3] = CStringGetTextDatum(attname);
+			nulls[3] = false;
+		}
+
+		values[4] = BoolGetDatum(csentry->key.inh);
+		nulls[4] = false;
+		values[5] = Float4GetDatum(stats->stanullfrac);
+		nulls[5] = false;
+		values[6] = Int32GetDatum(stats->stawidth);
+		nulls[6] = false;
+		values[7] = Float4GetDatum(stats->stadistinct);
+		nulls[7] = false;
+
+		/* Find which slots contain MCV, histogram, and correlation */
+		mcv_slot = -1;
+		hist_slot = -1;
+		corr_slot = -1;
+		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
+		{
+			int16		kind = (&stats->stakind1)[k];
+
+			if (kind == STATISTIC_KIND_MCV)
+				mcv_slot = k;
+			else if (kind == STATISTIC_KIND_HISTOGRAM)
+				hist_slot = k;
+			else if (kind == STATISTIC_KIND_CORRELATION)
+				corr_slot = k;
+		}
+
+		/* MCV values (as text) and frequencies (as float4[]) */
+		if (mcv_slot >= 0)
+		{
+			AttStatsSlot sslot;
+
+			if (get_attstatsslot(&sslot, statstuple, STATISTIC_KIND_MCV,
+								 InvalidOid,
+								 ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS))
+			{
+				values[8] = CStringGetTextDatum(
+												format_stats_values_as_text(&sslot));
+				nulls[8] = false;
+
+				if (sslot.nnumbers > 0)
+				{
+					Datum	   *num_datums;
+					int			j;
+
+					num_datums = (Datum *) palloc(sslot.nnumbers * sizeof(Datum));
+					for (j = 0; j < sslot.nnumbers; j++)
+						num_datums[j] = Float4GetDatum(sslot.numbers[j]);
+					values[9] = PointerGetDatum(
+												construct_array_builtin(num_datums, sslot.nnumbers,
+																		FLOAT4OID));
+					nulls[9] = false;
+					pfree(num_datums);
+				}
+
+				free_attstatsslot(&sslot);
+			}
+		}
+
+		/* Histogram bounds (as text) */
+		if (hist_slot >= 0)
+		{
+			AttStatsSlot sslot;
+
+			if (get_attstatsslot(&sslot, statstuple, STATISTIC_KIND_HISTOGRAM,
+								 InvalidOid, ATTSTATSSLOT_VALUES))
+			{
+				values[10] = CStringGetTextDatum(
+												 format_stats_values_as_text(&sslot));
+				nulls[10] = false;
+
+				free_attstatsslot(&sslot);
+			}
+		}
+
+		/* Correlation */
+		if (corr_slot >= 0)
+		{
+			AttStatsSlot sslot;
+
+			if (get_attstatsslot(&sslot, statstuple, STATISTIC_KIND_CORRELATION,
+								 InvalidOid, ATTSTATSSLOT_NUMBERS))
+			{
+				if (sslot.nnumbers > 0)
+				{
+					values[11] = Float4GetDatum(sslot.numbers[0]);
+					nulls[11] = false;
+				}
+
+				free_attstatsslot(&sslot);
+			}
+		}
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+							 values, nulls);
+	}
+
+	return (Datum) 0;
+}
+
+/*
+ * pg_gtt_clear_stats
+ *		Discard per-session relation- and column-level statistics for a GTT.
+ *
+ * If a regclass argument is provided, clears stats only for that table.  If
+ * NULL (the default), clears stats for every GTT this session has touched.
+ * Affects only the calling session's private state; the planner falls back
+ * to default estimates until ANALYZE runs again in this session.
+ *
+ * Privilege rule mirrors the read-side SRFs (pg_gtt_relstats /
+ * pg_gtt_colstats): SELECT on the relation is sufficient.  A user can only
+ * affect stats they could already see, and the cleared state is private to
+ * the calling backend, so a stricter check would not buy anything.
+ */
+Datum
+pg_gtt_clear_stats(PG_FUNCTION_ARGS)
+{
+	HASH_SEQ_STATUS status;
+	GttStorageEntry *entry;
+	List	   *to_reset = NIL;
+	Oid			filter_relid = InvalidOid;
+
+	if (!PG_ARGISNULL(0))
+	{
+		filter_relid = PG_GETARG_OID(0);
+		if (OidIsValid(filter_relid))
+		{
+			if (pg_class_aclcheck(filter_relid, GetUserId(),
+								  ACL_SELECT) == ACLCHECK_OK)
+				GttResetSessionStats(filter_relid);
+		}
+		PG_RETURN_VOID();
+	}
+
+	if (gtt_storage_hash == NULL)
+		PG_RETURN_VOID();
+
+	/*
+	 * Collect the relids first.  GttResetSessionStats() calls
+	 * gtt_reset_colstats_for_rel() which walks the column-stats hash, and
+	 * mutating either hash inside an open hash_seq_search of the storage hash
+	 * is fragile; deferring keeps the iteration simple.
+	 */
+	hash_seq_init(&status, gtt_storage_hash);
+	while ((entry = (GttStorageEntry *) hash_seq_search(&status)) != NULL)
+	{
+		if (entry->is_index)
+			continue;
+		if (pg_class_aclcheck(entry->relid, GetUserId(),
+							  ACL_SELECT) != ACLCHECK_OK)
+			continue;
+		to_reset = lappend_oid(to_reset, entry->relid);
+	}
+
+	foreach_oid(relid, to_reset)
+		GttResetSessionStats(relid);
+	list_free(to_reset);
+
+	PG_RETURN_VOID();
 }
