@@ -5113,6 +5113,19 @@ ATController(AlterTableStmt *parsetree,
 	List	   *wqueue = NIL;
 	ListCell   *lcmd;
 
+	/*
+	 * For a global temporary table, refuse the ALTER TABLE outright if any
+	 * peer session has live per-session storage.  Their data was written
+	 * against the existing schema, so a column type change, NOT NULL flip,
+	 * new check constraint, unique/primary key, etc., could invalidate it.
+	 * The session-level AccessShareLock acquired in GttInitSessionStorage is
+	 * dropped by LockReleaseAll(allLocks=true) on a peer's transaction abort,
+	 * so the lock alone cannot keep us out -- the shared sessions registry
+	 * does.
+	 */
+	if (RelationIsGlobalTemp(rel))
+		GttCheckAlterable(RelationGetRelid(rel));
+
 	/* Phase 1: preliminary examination of commands, create work queue */
 	foreach(lcmd, cmds)
 	{

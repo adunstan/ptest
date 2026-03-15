@@ -1921,9 +1921,18 @@ heap_drop_with_catalog(Oid relid)
 	 * hash entry and the session-level lock.  Physical file unlinking goes
 	 * through the normal PendingRelDelete path above (rd_locator has been
 	 * redirected to the per-session locator).
+	 *
+	 * Before scheduling cleanup, consult the shared-memory sessions registry:
+	 * if any other backend has live per-session storage for this GTT, refuse
+	 * the drop.  We hold AccessExclusiveLock, so no other session can enter
+	 * GttInitSessionStorage (which would add to the registry) until we
+	 * complete or abort.
 	 */
 	if (RelationIsGlobalTemp(rel))
+	{
+		GttCheckDroppable(relid);
 		GttScheduleDropSessionStorage(relid);
+	}
 
 	/* ensure that stats are dropped if transaction commits */
 	pgstat_drop_relation(rel);

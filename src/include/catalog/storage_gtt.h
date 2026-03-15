@@ -13,6 +13,7 @@
 #ifndef STORAGE_GTT_H
 #define STORAGE_GTT_H
 
+#include "storage/shmem.h"
 #include "utils/rel.h"
 
 extern void GttInitSessionStorage(Relation relation);
@@ -27,6 +28,17 @@ extern void GttMarkIndexBuildDeferred(Relation indexRelation);
 extern void GttPrepareIndexAccess(Relation indexRelation);
 extern void PreCommit_gtt_on_commit(void);
 extern void GttResetAllSessionData(void);
+
+/*
+ * Cross-session sessions registry for DDL safety.  Backends that create
+ * per-session GTT storage register themselves in a shared hash; DROP TABLE,
+ * ALTER TABLE and CREATE INDEX consult it and error out if any other
+ * session has live data.  No session-level heavyweight lock is taken for a
+ * GTT, so the registry is the sole cross-session guard.
+ */
+extern PGDLLIMPORT const ShmemCallbacks GttSessionsShmemCallbacks;
+extern void GttCheckDroppable(Oid relid);
+extern void GttCheckAlterable(Oid relid);
 
 /* Per-session relation-level statistics for planner */
 extern bool GttGetSessionStats(Oid relid, BlockNumber *relpages,
