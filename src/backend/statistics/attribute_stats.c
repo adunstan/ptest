@@ -20,6 +20,7 @@
 #include "access/heapam.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_operator.h"
 #include "nodes/makefuncs.h"
 #include "statistics/statistics.h"
@@ -184,6 +185,15 @@ attribute_statistics_update(FunctionCallInfo fcinfo)
 	reloid = RangeVarGetRelidExtended(makeRangeVar(nspname, relname, -1),
 									  ShareUpdateExclusiveLock, 0,
 									  RangeVarCallbackForStats, &locked_table);
+
+	/*
+	 * Reject global temporary tables: ANALYZE on a GTT writes session-private
+	 * column statistics rather than pg_statistic rows, and the planner reads
+	 * them back via SearchStats().  Writing pg_statistic for a GTT
+	 * here would surface in any session that has not yet run ANALYZE (its
+	 * per-session miss would fall back on the syscache).
+	 */
+	stats_check_not_global_temp(reloid, relname);
 
 	/* user can specify either attname or attnum, but not both */
 	if (!PG_ARGISNULL(ATTNAME_ARG))
@@ -622,6 +632,9 @@ pg_clear_attribute_stats(PG_FUNCTION_ARGS)
 	reloid = RangeVarGetRelidExtended(makeRangeVar(nspname, relname, -1),
 									  ShareUpdateExclusiveLock, 0,
 									  RangeVarCallbackForStats, &locked_table);
+
+	/* See attribute_statistics_update() for the rationale. */
+	stats_check_not_global_temp(reloid, relname);
 
 	attname = TextDatumGetCString(PG_GETARG_DATUM(C_ATTNAME_ARG));
 	attnum = get_attnum(reloid, attname);

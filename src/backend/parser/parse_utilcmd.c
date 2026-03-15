@@ -1592,29 +1592,46 @@ expandTableLikeClause(RangeVar *heapRel, TableLikeClause *table_like_clause)
 
 		parent_extstats = RelationGetStatExtList(relation);
 
-		foreach(l, parent_extstats)
+		/*
+		 * Global temporary tables cannot have extended statistics: their data
+		 * is per-session, but pg_statistic_ext_data is shared, so any stats
+		 * would reflect a single session's sample and mislead others (see
+		 * CreateStatistics).  Rather than fail outright, skip cloning the
+		 * parent's statistics objects, but warn so the omission is not
+		 * silent.
+		 */
+		if (parent_extstats != NIL && RelationIsGlobalTemp(childrel))
+			ereport(WARNING,
+					(errmsg("statistics objects not copied to global temporary table \"%s\"",
+							RelationGetRelationName(childrel)),
+					 errdetail("Global temporary tables cannot have extended statistics.")));
+		else
 		{
-			Oid			parent_stat_oid = lfirst_oid(l);
-			CreateStatsStmt *stats_stmt;
-
-			stats_stmt = generateClonedExtStatsStmt(heapRel,
-													RelationGetRelid(childrel),
-													parent_stat_oid,
-													attmap);
-
-			/* Copy comment on statistics object, if requested */
-			if (table_like_clause->options & CREATE_TABLE_LIKE_COMMENTS)
+			foreach(l, parent_extstats)
 			{
-				comment = GetComment(parent_stat_oid, StatisticExtRelationId, 0);
+				Oid			parent_stat_oid = lfirst_oid(l);
+				CreateStatsStmt *stats_stmt;
 
-				/*
-				 * We make use of CreateStatsStmt's stxcomment option, so as
-				 * not to need to know now what name the statistics will have.
-				 */
-				stats_stmt->stxcomment = comment;
+				stats_stmt = generateClonedExtStatsStmt(heapRel,
+														RelationGetRelid(childrel),
+														parent_stat_oid,
+														attmap);
+
+				/* Copy comment on statistics object, if requested */
+				if (table_like_clause->options & CREATE_TABLE_LIKE_COMMENTS)
+				{
+					comment = GetComment(parent_stat_oid, StatisticExtRelationId, 0);
+
+					/*
+					 * We make use of CreateStatsStmt's stxcomment option, so
+					 * as not to need to know now what name the statistics
+					 * will have.
+					 */
+					stats_stmt->stxcomment = comment;
+				}
+
+				result = lappend(result, stats_stmt);
 			}
-
-			result = lappend(result, stats_stmt);
 		}
 
 		list_free(parent_extstats);

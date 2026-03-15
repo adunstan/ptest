@@ -137,6 +137,19 @@ CreateStatistics(CreateStatsStmt *stmt, bool check_rights)
 					 errdetail_relkind_not_supported(rel->rd_rel->relkind)));
 
 		/*
+		 * Extended statistics are stored in the shared pg_statistic_ext_data
+		 * catalog, but global temporary tables have per-session data, so any
+		 * stats gathered by ANALYZE would reflect a single session's sample
+		 * and be misleading for others.  Reject the command outright rather
+		 * than silently accepting a definition that will never be populated.
+		 */
+		if (RelationIsGlobalTemp(rel))
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cannot define statistics for global temporary table \"%s\"",
+						   RelationGetRelationName(rel)));
+
+		/*
 		 * You must own the relation to create stats on it.
 		 *
 		 * NB: Concurrent changes could cause this function's lookup to find a

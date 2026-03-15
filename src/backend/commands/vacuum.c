@@ -35,6 +35,7 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_inherits.h"
 #include "commands/async.h"
@@ -1068,6 +1069,16 @@ get_all_vacuum_rels(MemoryContext vac_context, int options)
 			!isTempOrTempToastNamespace(classForm->relnamespace))
 			continue;
 
+		/*
+		 * Skip global temporary tables.  vacuum_rel() would skip them anyway,
+		 * but doing so silently here avoids emitting a stream of INFO
+		 * "skipping vacuum" messages on a database-wide VACUUM. A VACUUM that
+		 * names a GTT explicitly still reaches vacuum_rel() and is reported
+		 * there.
+		 */
+		if (classForm->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+			continue;
+
 		/* check permissions of relation */
 		if (!vacuum_is_permitted_for_relation(relid, classForm, options))
 			continue;
@@ -1117,6 +1128,21 @@ vacuum_get_cutoffs(Relation rel, const VacuumParams *params,
 	MultiXactId nextMXID,
 				safeOldestMxact,
 				aggressiveMXIDCutoff;
+
+	/*
+	 * Global temporary tables have session-local storage and carry invalid
+	 * relfrozenxid/relminmxid in their shared pg_class row, so they must
+	 * never reach the freeze machinery.  Every caller is expected to skip
+	 * them well before this point (see vacuum_rel() and cluster_rel());
+	 * arriving here with one means a skip was missed.  Computing cutoffs
+	 * would either trip the downstream
+	 * TransactionIdIsNormal()/MultiXactIdIsValid() assertions or silently
+	 * freeze session-local data against bogus limits, so error out loudly
+	 * instead.
+	 */
+	if (RelationIsGlobalTemp(rel))
+		elog(ERROR, "cannot compute freeze cutoffs for global temporary table \"%s\"",
+			 RelationGetRelationName(rel));
 
 	/* Use mutable copies of freeze age parameters */
 	freeze_min_age = params->freeze_min_age;
@@ -2153,6 +2179,29 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 		return false;
+	}
+
+	/*
+	 * Skip the vacuum portion for global temporary tables.  GTT data lives in
+	 * per-session local buffers with no shared freeze state, so the vacuum
+	 * machinery (which assumes valid relfrozenxid/relminmxid) cannot safely
+	 * process them.
+	 *
+	 * If ANALYZE was requested in the same command (VACUUM (ANALYZE)), we
+	 * return true so the caller still runs analyze_rel on this relation.
+	 * Otherwise we return false to short-circuit completely.
+	 */
+	if (RelationIsGlobalTemp(rel))
+	{
+		bool		can_analyze = (params.options & VACOPT_ANALYZE) != 0;
+
+		ereport(can_analyze ? DEBUG1 : INFO,
+				errmsg("skipping vacuum of \"%s\" --- data is session-local for a global temporary table",
+					   RelationGetRelationName(rel)));
+		relation_close(rel, lmode);
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		return can_analyze;
 	}
 
 	/*

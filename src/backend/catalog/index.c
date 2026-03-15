@@ -52,6 +52,7 @@
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
 #include "catalog/storage.h"
+#include "catalog/storage_gtt.h"
 #include "catalog/storage_xlog.h"
 #include "commands/event_trigger.h"
 #include "commands/progress.h"
@@ -3800,6 +3801,17 @@ reindex_index(const ReindexStmt *stmt, Oid indexId,
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot reindex temporary tables of other sessions")));
+
+	/*
+	 * Don't allow reindex on global temporary tables.  REINDEX assigns a new
+	 * relfilenode in the shared catalog via RelationSetNewRelfilenumber,
+	 * which would desynchronize per-session storage mappings in other
+	 * sessions.  GTT indexes are rebuilt lazily per-session as needed.
+	 */
+	if (RelationIsGlobalTemp(iRel))
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("cannot reindex global temporary tables"));
 
 	/*
 	 * Don't allow reindex of an invalid index on TOAST table.  This is a

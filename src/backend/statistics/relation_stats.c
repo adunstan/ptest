@@ -20,6 +20,7 @@
 #include "access/heapam.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_class.h"
 #include "nodes/makefuncs.h"
 #include "statistics/stat_utils.h"
 #include "utils/builtins.h"
@@ -100,6 +101,15 @@ relation_statistics_update(FunctionCallInfo fcinfo)
 	reloid = RangeVarGetRelidExtended(makeRangeVar(nspname, relname, -1),
 									  ShareUpdateExclusiveLock, 0,
 									  RangeVarCallbackForStats, &locked_table);
+
+	/*
+	 * Reject global temporary tables.  Their data is per-session, so the
+	 * shared pg_class row is never read by the planner for query estimation
+	 * (GttGetSessionStats() supplies session-private values), and writing
+	 * shared values would mislead any session that has not yet run ANALYZE
+	 * because the per-session miss would fall back on these values.
+	 */
+	stats_check_not_global_temp(reloid, relname);
 
 	if (!PG_ARGISNULL(RELPAGES_ARG))
 	{

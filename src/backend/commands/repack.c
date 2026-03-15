@@ -48,6 +48,7 @@
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/toasting.h"
@@ -599,6 +600,18 @@ cluster_rel(RepackCommand cmd, Relation OldHeap, Oid indexOid,
 				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 		/*- translator: first %s is name of a SQL command, eg. REPACK */
 				errmsg("cannot execute %s on temporary tables of other sessions",
+					   RepackCommandAsString(cmd)));
+
+	/*
+	 * Global temporary tables cannot be repacked or clustered because these
+	 * operations assign a new relfilenode in the shared catalog, which would
+	 * desynchronize per-session storage mappings.
+	 */
+	if (RelationIsGlobalTemp(OldHeap))
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+		/*- translator: first %s is name of a SQL command, eg. REPACK */
+				errmsg("cannot execute %s on global temporary tables",
 					   RepackCommandAsString(cmd)));
 
 	/*
@@ -2186,6 +2199,18 @@ get_tables_to_repack(RepackCommand cmd, bool usingindex, MemoryContext permcxt)
 				continue;
 			}
 
+			/*
+			 * Skip global temporary tables; they cannot be repacked or
+			 * clustered (see cluster_rel()).  Aborting a database-wide REPACK
+			 * on every GTT in the catalog would be unhelpful.
+			 */
+			if (classForm->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+			{
+				ReleaseSysCache(classtup);
+				UnlockRelationOid(index->indrelid, AccessShareLock);
+				continue;
+			}
+
 			ReleaseSysCache(classtup);
 
 			/* noisily skip rels which the user can't process */
@@ -2245,6 +2270,13 @@ get_tables_to_repack(RepackCommand cmd, bool usingindex, MemoryContext permcxt)
 			/* Skip temp relations belonging to other sessions */
 			if (class->relpersistence == RELPERSISTENCE_TEMP &&
 				!isTempOrTempToastNamespace(class->relnamespace))
+			{
+				UnlockRelationOid(class->oid, AccessShareLock);
+				continue;
+			}
+
+			/* See the matching skip in the USING INDEX branch above. */
+			if (class->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
 			{
 				UnlockRelationOid(class->oid, AccessShareLock);
 				continue;
@@ -2408,6 +2440,19 @@ process_single_relation(RepackStmt *stmt, LOCKMODE lockmode, bool isTopLevel,
 				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 		/*- translator: first %s is name of a SQL command, eg. REPACK */
 				errmsg("cannot execute %s on temporary tables of other sessions",
+					   RepackCommandAsString(stmt->command)));
+
+	/*
+	 * Reject GTTs here as well as in cluster_rel(): for a partitioned GTT we
+	 * return below without calling cluster_rel(), so the caller would
+	 * otherwise iterate the partitions and produce a less helpful error
+	 * naming one of them.
+	 */
+	if (RelationIsGlobalTemp(rel))
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+		/*- translator: first %s is name of a SQL command, eg. REPACK */
+				errmsg("cannot execute %s on global temporary tables",
 					   RepackCommandAsString(stmt->command)));
 
 	/*

@@ -1765,9 +1765,26 @@ RemoveRelations(DropStmt *drop)
 		/*
 		 * Decide if concurrent mode needs to be used here or not.  The
 		 * callback retrieved the rel's persistence for us.
+		 *
+		 * Global temporary tables have per-session local storage that other
+		 * backends cannot see, so the multi-transaction concurrent protocol
+		 * is neither necessary nor safe.  Mirror the CREATE INDEX
+		 * CONCURRENTLY fallback in indexcmds.c: emit a NOTICE and proceed
+		 * with a non-concurrent drop, upgrading our lock from
+		 * ShareUpdateExclusiveLock to AccessExclusiveLock.  The final
+		 * heap_drop_with_catalog still passes through GttCheckDroppable, so
+		 * peers with live per-session storage block the drop either way.
 		 */
 		if (drop->concurrent &&
-			state.actual_relpersistence != RELPERSISTENCE_TEMP)
+			state.actual_relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+		{
+			ereport(NOTICE,
+					errmsg("DROP INDEX CONCURRENTLY is not supported for global temporary tables"),
+					errdetail("Falling back to a non-concurrent drop."));
+			LockRelationOid(relOid, AccessExclusiveLock);
+		}
+		else if (drop->concurrent &&
+				 state.actual_relpersistence != RELPERSISTENCE_TEMP)
 		{
 			Assert(list_length(drop->objects) == 1 &&
 				   drop->removeType == OBJECT_INDEX);
