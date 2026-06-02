@@ -41,6 +41,7 @@
 #include "archive/archive_module.h"
 #include "catalog/namespace.h"
 #include "catalog/storage.h"
+#include "catalog/storage_gtt.h"
 #include "commands/async.h"
 #include "commands/extension.h"
 #include "commands/event_trigger.h"

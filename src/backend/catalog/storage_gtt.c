@@ -27,6 +27,8 @@
 #include "access/relation.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/multixact.h"
+#include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/heap.h"
 #include "catalog/index.h"
@@ -87,6 +89,7 @@ typedef struct GttStorageEntry
 	RelFileLocator locator;		/* per-session physical storage location */
 	bool		storage_created;	/* has smgr file been created? */
 	bool		is_index;		/* is this an index relation? */
+	bool		is_sequence;	/* is this a sequence relation? */
 	bool		index_built;	/* has index been built in this session? */
 	bool		build_deferred; /* index_build deferred the physical build
 								 * because the parent heap was unmaterialized */
@@ -106,6 +109,29 @@ typedef struct GttStorageEntry
 	BlockNumber relpages;		/* per-session page count */
 	float4		reltuples;		/* per-session tuple count */
 	BlockNumber relallvisible;	/* per-session all-visible pages */
+
+	/*
+	 * Transaction-ID horizon tracking (heap entries only).  oldest_xid is a
+	 * conservative lower bound on the oldest unfrozen xmin in this session's
+	 * data for the relation: it is set to the current XID on the first write
+	 * into otherwise-empty storage and reset to InvalidTransactionId whenever
+	 * the storage is emptied (truncate / on-commit-delete / abort-discard).
+	 * Later writes only ever use newer XIDs, and a tuple's xmin cannot be
+	 * older than the storage's first write, so this never overstates how
+	 * recent the data is.  xid_warned throttles the approaching-horizon
+	 * WARNING to once per relation per session.  See GttPrepareAccess().
+	 *
+	 * oldest_xid doubles as the session-local relfrozenxid: a VACUUM of the
+	 * GTT freezes this session's storage in place and advances oldest_xid to
+	 * the oldest unfrozen XID it leaves behind (see
+	 * GttUpdateSessionFrozenXids). session_relminmxid is the matching
+	 * session-local relminmxid; it is set to the current next-multixact on
+	 * the first write and advanced by VACUUM. Neither value can live in the
+	 * shared pg_class row, which is common to all sessions.
+	 */
+	TransactionId oldest_xid;
+	bool		xid_warned;
+	MultiXactId session_relminmxid;
 } GttStorageEntry;
 
 /* Backend-local hash table: GTT OID -> GttStorageEntry */
@@ -140,6 +166,9 @@ typedef struct GttSwapUndo
 	BlockNumber prev_relpages;
 	float4		prev_reltuples;
 	BlockNumber prev_relallvisible;
+	TransactionId prev_oldest_xid;
+	bool		prev_xid_warned;
+	MultiXactId prev_session_relminmxid;
 } GttSwapUndo;
 
 /* List of GttSwapUndo *, newest first, allocated in TopMemoryContext */
@@ -173,6 +202,15 @@ typedef struct GttColStatsEntry
 
 /* Backend-local hash table: (relid, attnum, inh) -> GttColStatsEntry */
 static HTAB *gtt_colstats_hash = NULL;
+
+/*
+ * GUC: how many transactions of head room to leave before the cluster
+ * CLOG-truncation horizon when warning that a GTT's data is aging toward
+ * transaction-ID wraparound.  The hard error fires at the horizon itself;
+ * this only controls the earlier WARNING.  Generous by default so operators
+ * get ample notice.  See GttPrepareAccess().
+ */
+int			global_temp_xid_warn_margin = 100000000;
 
 /* Guard against recursive index builds */
 static bool gtt_building_index = false;
@@ -235,10 +273,15 @@ static void gtt_subxact_callback(SubXactEvent event,
 static void gtt_remove_entry(GttStorageEntry *entry);
 static void gtt_revert_storage(GttStorageEntry *entry);
 static void gtt_remove_relids(List *to_remove);
-static void gtt_init_entry(GttStorageEntry *entry, Relation relation);
-static void gtt_build_index_internal(Relation indexRelation, bool force);
+static void gtt_truncate_dependents(List *heap_relids);
 static void gtt_truncate_smgr(GttStorageEntry *entry);
 static void gtt_swap_undo_apply(GttSwapUndo *undo);
+static void gtt_init_entry(GttStorageEntry *entry, Relation relation);
+static void gtt_build_index_internal(Relation indexRelation, bool force);
+#ifdef USE_ASSERT_CHECKING
+static bool gtt_session_registered(Oid relid);
+static void gtt_check_invariants(void);
+#endif
 static void gtt_sessions_add(Oid relid, Oid table_relid);
 static void gtt_sessions_remove(Oid relid);
 static ProcNumber gtt_first_other_session_with_storage(Oid relid);
@@ -449,28 +492,35 @@ GttInitSessionStorage(Relation relation)
 	 * starts out equal to the catalog relfilenode, but a transactional
 	 * TRUNCATE swaps in a new session-local relfilenumber via
 	 * GttSetNewSessionRelfilenumber without touching the shared catalog, so
-	 * the two may legitimately diverge.  CLUSTER, REINDEX, SET TABLESPACE,
-	 * SET LOGGED and heap rewrites (which would rotate the shared relfilenode
-	 * itself) remain blocked for GTTs.
+	 * the two may legitimately diverge -- though only once storage has been
+	 * materialized (an entry without storage was either just created or just
+	 * refreshed above, so it must match the catalog).  CLUSTER, REINDEX, SET
+	 * TABLESPACE, SET LOGGED and heap rewrites (which would rotate the shared
+	 * relfilenode itself) remain blocked for GTTs.
 	 */
-	Assert(RelFileNumberIsValid(entry->locator.relNumber));
+	Assert(entry->storage_created ||
+		   entry->locator.relNumber == relation->rd_rel->relfilenode);
 
 	/* Point the relation at our per-session storage */
 	relation->rd_locator = entry->locator;
 	relation->rd_backend = ProcNumberForTempRelations();
 
 	/*
-	 * No physical file is created here.  Reads of unmaterialized storage
-	 * complete without one (the zero-blocks short-circuits in
-	 * bufmgr.c/tableam.c report the relation empty), so the file is deferred
-	 * to GttEnsureSessionStorage at the first genuine data access.
+	 * Note: no physical file is created here.  Reads of unmaterialized
+	 * storage complete without one (the zero-blocks short-circuits in
+	 * bufmgr.c/tableam.c report the relation empty), so the file -- and the
+	 * sessions-registry entry that makes peer DDL respect our data -- are
+	 * deferred to GttEnsureSessionStorage at the first genuine data access.
 	 */
 }
 
 /*
  * gtt_init_entry
- *		Initialize a newly created per-session map entry from the relation's
- *		current catalog state.
+ *		(Re)initialize a per-session map entry from the relation's current
+ *		catalog state.
+ *
+ * Used for newly created entries and to refresh a stale resource-less
+ * entry whose OID has been recycled (see GttInitSessionStorage).
  */
 static void
 gtt_init_entry(GttStorageEntry *entry, Relation relation)
@@ -498,6 +548,7 @@ gtt_init_entry(GttStorageEntry *entry, Relation relation)
 	entry->locator.relNumber = relation->rd_rel->relfilenode;
 	entry->storage_created = false;
 	entry->is_index = (relation->rd_rel->relkind == RELKIND_INDEX);
+	entry->is_sequence = (relation->rd_rel->relkind == RELKIND_SEQUENCE);
 	if (entry->is_index && relation->rd_index != NULL)
 		entry->heap_relid = relation->rd_index->indrelid;
 	else
@@ -515,6 +566,9 @@ gtt_init_entry(GttStorageEntry *entry, Relation relation)
 	entry->relpages = 0;
 	entry->reltuples = 0;
 	entry->relallvisible = 0;
+	entry->oldest_xid = InvalidTransactionId;
+	entry->xid_warned = false;
+	entry->session_relminmxid = InvalidMultiXactId;
 	entry->on_commit_delete = false;
 	entry->toast_relid = InvalidOid;
 
@@ -528,11 +582,23 @@ gtt_init_entry(GttStorageEntry *entry, Relation relation)
 
 /*
  * GttEnsureSessionStorage
- *		Materialize this session's physical storage for a GTT.
+ *		Materialize this session's storage for a GTT: create the per-session
+ *		file and register in the shared sessions registry.
  *
- * Called the first time a GTT is genuinely accessed for data: it creates the
- * per-session file (registered for delete-at-abort via RelationCreateStorage).
- * Reads never call this -- an unmaterialized GTT reads as empty.
+ * Called at the first genuine data access (heap inserts, index builds,
+ * sequence seeding), not at relation open: sessions that merely plan or
+ * read a never-written GTT hold no file and no registry entry, so they
+ * neither pay for storage nor block peer DDL.
+ *
+ * Registration happens here, with the file: "another session has live
+ * per-session data" (GttCheckDroppable/GttCheckAlterable) is then
+ * literally true.  We deliberately take no session-level lock on the GTT
+ * -- a session-lifetime AccessShareLock would make any AccessExclusiveLock
+ * acquisition (a peer's TRUNCATE of its own private data, or a DROP that
+ * the registry would reject with a clean error) block until this backend
+ * disconnects.  In-flight windows are covered by the ordinary
+ * transaction-level lock our caller holds while we're added to the
+ * registry.
  */
 void
 GttEnsureSessionStorage(Relation relation)
@@ -566,9 +632,38 @@ GttEnsureSessionStorage(Relation relation)
 				errcode(ERRCODE_INVALID_TRANSACTION_STATE),
 				errmsg("cannot initialize global temporary table storage during a parallel operation"));
 
-	RelationCreateStorage(entry->locator, RELPERSISTENCE_GLOBAL_TEMP, true);
+	/*
+	 * Create the file, then register so peer DDL sees our live data.
+	 *
+	 * For tables and indexes the file carries a delete-at-abort registration
+	 * and the materialization is recorded in storage_subid, making it fully
+	 * transactional.  Storage of a pre-existing sequence is deliberately NOT
+	 * transactional: sequence advancement must survive the abort of whichever
+	 * transaction happened to first materialize the sequence, or rolled-back
+	 * nextval calls would hand out the same values again -- regular and local
+	 * temporary sequences never replay values.  Such a file persists until
+	 * session end, DISCARD, or DROP, and its entry is made permanent for the
+	 * session (create_subid cleared) so the abort paths leave both alone.
+	 * Only when the sequence's own defining CREATE is still in flight
+	 * (rd_createSubid) is the storage transactional like everything else: if
+	 * that CREATE aborts, the catalog row vanishes and the file must go with
+	 * it.
+	 */
+	if (entry->is_sequence &&
+		relation->rd_createSubid == InvalidSubTransactionId)
+	{
+		RelationCreateStorage(entry->locator, RELPERSISTENCE_GLOBAL_TEMP,
+							  false);
+		entry->create_subid = InvalidSubTransactionId;
+	}
+	else
+	{
+		RelationCreateStorage(entry->locator, RELPERSISTENCE_GLOBAL_TEMP,
+							  true);
+		if (!entry->is_sequence)
+			entry->storage_subid = GetCurrentSubTransactionId();
+	}
 	entry->storage_created = true;
-	entry->storage_subid = GetCurrentSubTransactionId();
 	gtt_xact_state_dirty = true;
 
 	gtt_sessions_add(relid,
@@ -653,6 +748,9 @@ GttSetNewSessionRelfilenumber(Relation relation, RelFileNumber newrelfilenumber)
 	undo->prev_relpages = entry->relpages;
 	undo->prev_reltuples = entry->reltuples;
 	undo->prev_relallvisible = entry->relallvisible;
+	undo->prev_oldest_xid = entry->oldest_xid;
+	undo->prev_xid_warned = entry->xid_warned;
+	undo->prev_session_relminmxid = entry->session_relminmxid;
 	gtt_swap_undo = lcons(undo, gtt_swap_undo);
 	MemoryContextSwitchTo(oldcxt);
 
@@ -661,7 +759,8 @@ GttSetNewSessionRelfilenumber(Relation relation, RelFileNumber newrelfilenumber)
 
 	/*
 	 * The new file is empty: indexes must be lazily rebuilt on next access
-	 * (GttBuildIndexIfNeeded), and previous ANALYZE results no longer apply.
+	 * (GttBuildIndexIfNeeded), previous ANALYZE results no longer apply, and
+	 * there is no unfrozen data left to track for wraparound purposes.
 	 * Column-level statistics are left alone, matching the behavior of
 	 * TRUNCATE on regular tables, which does not clear pg_statistic.
 	 */
@@ -683,6 +782,9 @@ GttSetNewSessionRelfilenumber(Relation relation, RelFileNumber newrelfilenumber)
 	entry->relpages = 0;
 	entry->reltuples = 0;
 	entry->relallvisible = 0;
+	entry->oldest_xid = InvalidTransactionId;
+	entry->xid_warned = false;
+	entry->session_relminmxid = InvalidMultiXactId;
 
 	/* Point the open relcache entry at the new storage. */
 	relation->rd_locator = entry->locator;
@@ -714,6 +816,9 @@ gtt_swap_undo_apply(GttSwapUndo *undo)
 	entry->relpages = undo->prev_relpages;
 	entry->reltuples = undo->prev_reltuples;
 	entry->relallvisible = undo->prev_relallvisible;
+	entry->oldest_xid = undo->prev_oldest_xid;
+	entry->xid_warned = undo->prev_xid_warned;
+	entry->session_relminmxid = undo->prev_session_relminmxid;
 
 	/*
 	 * Refresh the relcache entry so rd_locator points back at the surviving
@@ -724,19 +829,28 @@ gtt_swap_undo_apply(GttSwapUndo *undo)
 
 /*
  * GttHasSessionStorage
- *		Check if the current session has initialized storage for a GTT.
+ *		Check if the current session has materialized storage for a GTT.
+ *
+ * True only once a per-session file actually exists.  Sessions that have
+ * merely opened a GTT (planning, EXPLAIN, reading a never-written table)
+ * hold a backend-local map entry but no file; for them this returns false.
  *
  * Used by pg_relation_filepath to decide whether to surface the current
- * session's private file path for a GTT (or NULL when this session has
- * not yet accessed it).
+ * session's private file path, and by the zero-blocks short-circuits in
+ * bufmgr.c/tableam.c that let reads of unmaterialized storage complete
+ * without any file.
  */
 bool
 GttHasSessionStorage(Oid relid)
 {
+	GttStorageEntry *entry;
+
 	if (gtt_storage_hash == NULL)
 		return false;
 
-	return hash_search(gtt_storage_hash, &relid, HASH_FIND, NULL) != NULL;
+	entry = (GttStorageEntry *) hash_search(gtt_storage_hash, &relid,
+											HASH_FIND, NULL);
+	return entry != NULL && entry->storage_created;
 }
 
 /*
@@ -765,6 +879,238 @@ GttSessionIndexUsable(Oid relid)
 	entry = (GttStorageEntry *) hash_search(gtt_storage_hash, &relid,
 											HASH_FIND, NULL);
 	return entry != NULL && entry->storage_created && entry->index_built;
+}
+
+/*
+ * GttPrepareAccessGuts
+ *		Materialize storage for writes, and fail-closed guard against accessing global temporary table data whose
+ *		oldest unfrozen xmin has aged toward the transaction-ID wraparound /
+ *		CLOG-truncation horizon.
+ *
+ * A GTT contributes nothing to datfrozenxid (its shared pg_class row carries
+ * invalid relfrozenxid/relminmxid), so CLOG can be truncated, and XID
+ * assignment can advance, past a still-live GTT tuple's xmin unless this
+ * session freezes its own data.  A long-lived session that retains data in an
+ * ON COMMIT PRESERVE ROWS GTT can therefore reach a point where reading that
+ * data either fails with a "could not access status of transaction" error or
+ * is silently mis-judged once the xmin is ~2^31 in the past.  To prevent wrong
+ * results, refuse access once the relation's oldest tracked xmin reaches the
+ * cluster CLOG-truncation horizon (TransamVariables->oldestXid), and warn as
+ * it approaches.
+ *
+ * The remedy is to VACUUM the table: that freezes this session's storage in
+ * place and advances oldest_xid (the session relfrozenxid) past the horizon,
+ * after which the guard stays quiet.  VACUUM does not go through the guarded
+ * entry points, so it remains available even once reads here have started to
+ * fail -- though if a tuple's commit status was never hinted and its CLOG is
+ * already gone, even freezing cannot read it, and only TRUNCATE / reconnect
+ * recovers.  This is why we warn well ahead of the horizon: VACUUM during the
+ * warning window is the reliable escape.
+ *
+ * Called from the heap read and write entry points (see heapam.c / indexam.c)
+ * whenever the relation is a global temporary table.  For inserts, records the
+ * current XID as the relation's oldest tracked xmin the first time data is
+ * added to empty storage.  Only heap entries are tracked; indexes are checked
+ * via their heap relation at scan begin.
+ */
+void
+GttPrepareAccessGuts(Relation rel, bool is_insert)
+{
+	GttStorageEntry *entry;
+	Oid			relid = RelationGetRelid(rel);
+	TransactionId frontier;
+
+	if (gtt_storage_hash == NULL)
+		return;
+
+	entry = (GttStorageEntry *) hash_search(gtt_storage_hash, &relid,
+											HASH_FIND, NULL);
+	if (entry == NULL)
+		return;
+
+	/* the file the mapping promises must actually exist */
+	Assert(!entry->storage_created ||
+		   smgrexists(smgropen(entry->locator, ProcNumberForTempRelations()),
+					  MAIN_FORKNUM));
+
+	/*
+	 * Writes are the moment per-session storage springs into existence: reads
+	 * of unmaterialized storage complete without a file via the zero-blocks
+	 * short-circuits, but an insert is about to extend the relation and needs
+	 * the file (and the registry entry that makes peer DDL respect our
+	 * now-live data).
+	 */
+	if (is_insert && !entry->storage_created)
+		GttEnsureSessionStorage(rel);
+
+	/* Record the first write into otherwise-empty storage. */
+	if (is_insert && !TransactionIdIsValid(entry->oldest_xid))
+	{
+		/*
+		 * Seed with the top-level XID, not GetCurrentTransactionId(): inside
+		 * a subtransaction the latter returns the subxact's XID, which is
+		 * always newer than the parent's.  If the first write into empty
+		 * storage happened under a savepoint, a later write at an outer
+		 * nesting level would stamp tuples with an older xmin than the seed,
+		 * and VACUUM (which uses oldest_xid as the relfrozenxid cutoff) would
+		 * then see "xmin from before relfrozenxid".  The top-level XID is
+		 * assigned before any of its children, so it is a valid lower bound
+		 * for every xmin this transaction can write.
+		 */
+		entry->oldest_xid = GetTopTransactionId();
+		entry->xid_warned = false;
+
+		/*
+		 * Seed the session relminmxid too.  No multixact older than the
+		 * current next-multixact can appear in data written from here on, so
+		 * this is a valid lower bound; a later VACUUM may advance it.
+		 */
+		entry->session_relminmxid = ReadNextMultiXactId();
+		return;					/* freshly written data is current */
+	}
+
+	if (!TransactionIdIsValid(entry->oldest_xid))
+		return;					/* no data tracked for this relation */
+
+	/*
+	 * Read the cluster-wide CLOG-truncation horizon.  A lock-free read is
+	 * acceptable: oldestXid only ever advances, it changes only at CLOG
+	 * truncation (infrequently), and we re-check on every access.  A slightly
+	 * stale (older) value can only make us less aggressive, and the worst
+	 * case is then the ordinary "could not access status of transaction"
+	 * error rather than a wrong result.
+	 */
+	frontier = TransamVariables->oldestXid;
+	if (!TransactionIdIsValid(frontier))
+		return;
+
+	/*
+	 * Past the horizon: CLOG may be gone.  Refuse rather than risk
+	 * corruption.
+	 */
+	if (TransactionIdPrecedes(entry->oldest_xid, frontier))
+		ereport(ERROR,
+				errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				errmsg("global temporary table \"%s\" contains data older than the transaction-ID horizon",
+					   RelationGetRelationName(rel)),
+				errdetail("The oldest row was written by transaction %u, which precedes the cluster commit-log truncation horizon (%u).",
+						  entry->oldest_xid, frontier),
+				errhint("VACUUM the table to freeze its data in place; if that fails because the data is already past the commit-log horizon, TRUNCATE the table or reconnect."));
+
+	/*
+	 * Approaching the horizon: warn once per relation per session.
+	 *
+	 * We know oldest_xid is at or after the frontier (it did not precede it
+	 * above), so both the gap below the data and the cluster's total CLOG
+	 * history are forward distances under 2^31.  Warn when the data sits
+	 * within the configured head room of the frontier -- but only once the
+	 * CLOG history itself is longer than that head room.  Otherwise (a young
+	 * cluster, or one whose datfrozenxid is kept close to the next XID) the
+	 * head-room band would cover even freshly written data, producing a
+	 * warning that does not reflect any real risk.
+	 */
+	if (!entry->xid_warned && global_temp_xid_warn_margin > 0)
+	{
+		TransactionId next_xid = XidFromFullTransactionId(TransamVariables->nextXid);
+		uint32		clog_history = (uint32) (next_xid - frontier);
+		uint32		gap = (uint32) (entry->oldest_xid - frontier);
+		uint32		margin = (uint32) global_temp_xid_warn_margin;
+
+		if (clog_history > margin && gap <= margin)
+		{
+			ereport(WARNING,
+					errmsg("global temporary table \"%s\" contains data approaching the transaction-ID horizon",
+						   RelationGetRelationName(rel)),
+					errhint("VACUUM the table to freeze its data; otherwise it is lost if its oldest row reaches transaction-ID wraparound."));
+			entry->xid_warned = true;
+		}
+	}
+}
+
+/*
+ * GttGetSessionFrozenXids
+ *		Fetch the per-session freeze horizon for a global temporary table.
+ *
+ * VACUUM uses these in place of the shared pg_class relfrozenxid/relminmxid
+ * (which are always invalid for a GTT) as the starting cutoffs for the
+ * relation.  oldest_xid doubles as the session relfrozenxid; session_relminmxid
+ * is its multixact counterpart.  Returns false, leaving the outputs untouched,
+ * when this session has no tracked data for the relation -- there is then
+ * nothing to vacuum.
+ */
+bool
+GttGetSessionFrozenXids(Oid relid, TransactionId *relfrozenxid,
+						MultiXactId *relminmxid)
+{
+	GttStorageEntry *entry;
+
+	if (gtt_storage_hash == NULL)
+		return false;
+
+	entry = (GttStorageEntry *) hash_search(gtt_storage_hash, &relid,
+											HASH_FIND, NULL);
+	if (entry == NULL || !TransactionIdIsValid(entry->oldest_xid))
+		return false;
+
+	*relfrozenxid = entry->oldest_xid;
+	*relminmxid = entry->session_relminmxid;
+	return true;
+}
+
+/*
+ * GttUpdateSessionFrozenXids
+ *		Persist the freeze horizon left behind by a VACUUM of a global
+ *		temporary table.
+ *
+ * The shared pg_class row cannot hold per-session freeze state, so VACUUM
+ * stores its new relfrozenxid/relminmxid here instead.  The next VACUUM reads
+ * them back via GttGetSessionFrozenXids, and the wraparound guard
+ * (GttPrepareAccess) benefits immediately because oldest_xid is the same
+ * field.  Advancing the horizon clears the approaching-wraparound warning
+ * throttle.
+ *
+ * Invalid inputs (e.g. the index writeback, or a non-aggressive VACUUM that
+ * skipped all-visible pages) leave the stored values unchanged.  *_updated, if
+ * supplied, report whether the corresponding value advanced.
+ */
+void
+GttUpdateSessionFrozenXids(Oid relid, TransactionId relfrozenxid,
+						   MultiXactId relminmxid,
+						   bool *frozenxid_updated, bool *minmulti_updated)
+{
+	GttStorageEntry *entry;
+
+	if (frozenxid_updated)
+		*frozenxid_updated = false;
+	if (minmulti_updated)
+		*minmulti_updated = false;
+
+	if (gtt_storage_hash == NULL)
+		return;
+
+	entry = (GttStorageEntry *) hash_search(gtt_storage_hash, &relid,
+											HASH_FIND, NULL);
+	if (entry == NULL)
+		return;
+
+	if (TransactionIdIsNormal(relfrozenxid) &&
+		(!TransactionIdIsValid(entry->oldest_xid) ||
+		 TransactionIdPrecedes(entry->oldest_xid, relfrozenxid)))
+	{
+		entry->oldest_xid = relfrozenxid;
+		entry->xid_warned = false;
+		if (frozenxid_updated)
+			*frozenxid_updated = true;
+	}
+
+	if (MultiXactIdIsValid(relminmxid) &&
+		(!MultiXactIdIsValid(entry->session_relminmxid) ||
+		 MultiXactIdPrecedes(entry->session_relminmxid, relminmxid)))
+	{
+		entry->session_relminmxid = relminmxid;
+		if (minmulti_updated)
+			*minmulti_updated = true;
+	}
 }
 
 /*
@@ -866,6 +1212,10 @@ gtt_revert_storage(GttStorageEntry *entry)
 	 */
 	if (entry->is_index)
 		entry->build_deferred = true;
+
+	entry->oldest_xid = InvalidTransactionId;
+	entry->xid_warned = false;
+	entry->session_relminmxid = InvalidMultiXactId;
 }
 
 /*
@@ -894,6 +1244,132 @@ gtt_remove_relids(List *to_remove)
 }
 
 /*
+ * gtt_truncate_dependents
+ *		Physically empty the still-materialized indexes (and toast) of
+ *		heaps whose own storage was just reverted by an abort.
+ *
+ * When a heap's storage was created in the aborting (sub)transaction, its
+ * file is unlinked by PendingRelDelete -- but an index materialized in an
+ * EARLIER transaction (e.g. built empty by an index scan, or by CREATE
+ * INDEX on a then-populated heap) keeps its committed file, now full of
+ * entries whose TIDs point into the vanished heap file.  Those are not
+ * MVCC-dead references that visibility checks would hide; they dangle
+ * physically.  Truncate such indexes and clear index_built so the next
+ * access rebuilds them against the (now-empty) heap; the same pass covers
+ * toast relations via the heap's recorded toast_relid.
+ *
+ * Mirrors the heap_relids matching in PreCommit_gtt_on_commit.  Frees the
+ * list.
+ */
+static void
+gtt_truncate_dependents(List *heap_relids)
+{
+	HASH_SEQ_STATUS status;
+	GttStorageEntry *entry;
+
+	if (heap_relids == NIL)
+		return;
+
+	hash_seq_init(&status, gtt_storage_hash);
+	while ((entry = (GttStorageEntry *) hash_seq_search(&status)) != NULL)
+	{
+		if (entry->is_index)
+		{
+			if (OidIsValid(entry->heap_relid) &&
+				list_member_oid(heap_relids, entry->heap_relid) &&
+				entry->storage_created)
+			{
+				gtt_truncate_smgr(entry);
+				entry->index_built = false;
+			}
+		}
+		else if (list_member_oid(heap_relids, entry->relid))
+			gtt_truncate_smgr(entry);	/* toast heap; no-op if empty */
+	}
+	list_free(heap_relids);
+}
+
+#ifdef USE_ASSERT_CHECKING
+/*
+ * gtt_session_registered
+ *		Does the shared sessions registry hold this backend's entry for relid?
+ */
+static bool
+gtt_session_registered(Oid relid)
+{
+	GttSessionsKey key;
+	bool		found;
+
+	if (GttSessionsHash == NULL)
+		return false;
+
+	init_sessions_key(&key, relid);
+
+	LWLockAcquire(GttSessionsLock, LW_SHARED);
+	(void) hash_search(GttSessionsHash, &key, HASH_FIND, &found);
+	LWLockRelease(GttSessionsLock);
+
+	return found;
+}
+
+/*
+ * gtt_check_invariants
+ *		Cross-check the per-session storage map once a top-level transaction
+ *		has settled.
+ *
+ * The map's fields interact in ways that scattered updates can silently
+ * break (and have: every bug the randomized stress test found was a broken
+ * invariant here that only surfaced as a read error several statements
+ * later).  Catching the inconsistency at the transaction boundary that
+ * produced it points directly at the cause.  Filesystem-level agreement is
+ * asserted at the use sites instead (GttPrepareAccessGuts and
+ * gtt_build_index_internal), because this callback runs before
+ * smgrDoPendingDeletes and the files' fate is not yet settled here.
+ */
+static void
+gtt_check_invariants(void)
+{
+	HASH_SEQ_STATUS status;
+	GttStorageEntry *entry;
+
+	/* every swap was either committed or undone */
+	Assert(gtt_swap_undo == NIL);
+
+	hash_seq_init(&status, gtt_storage_hash);
+	while ((entry = (GttStorageEntry *) hash_seq_search(&status)) != NULL)
+	{
+		/* a top-level transaction end settles all subxact bookkeeping */
+		Assert(entry->create_subid == InvalidSubTransactionId);
+		Assert(entry->storage_subid == InvalidSubTransactionId);
+		Assert(entry->index_subid == InvalidSubTransactionId);
+		Assert(entry->stats_subid == InvalidSubTransactionId);
+		Assert(entry->demat_subid == InvalidSubTransactionId);
+		Assert(entry->drop_subid == InvalidSubTransactionId);
+
+		/* the relkind flags are mutually exclusive ... */
+		Assert(!(entry->is_index && entry->is_sequence));
+		/* ... and only indexes carry build state */
+		Assert(!entry->index_built || entry->is_index);
+		Assert(!entry->build_deferred || entry->is_index);
+
+		/* no storage => no index structure; a built index is not pending */
+		Assert(!entry->index_built || entry->storage_created);
+		Assert(!entry->index_built || !entry->build_deferred);
+
+		/*
+		 * The shared sessions registry mirrors materialization exactly --
+		 * except during backend exit, where gtt_session_cleanup (a shmem-exit
+		 * callback) deregisters everything before AbortOutOfAnyTransaction
+		 * triggers this walker for a still-open transaction (pg_dump, for
+		 * one, disconnects without closing its read-only transaction).
+		 */
+		Assert(proc_exit_inprogress ||
+			   entry->storage_created == gtt_session_registered(entry->relid));
+	}
+}
+#endif
+
+/*
  * gtt_xact_callback
  *		Reconcile gtt_storage_hash with transaction completion.
  *
@@ -914,6 +1390,7 @@ gtt_xact_callback(XactEvent event, void *arg)
 	List	   *to_remove = NIL;
 	List	   *to_invalidate = NIL;
 	List	   *to_deregister = NIL;
+	List	   *reverted_heaps = NIL;
 	ListCell   *lc;
 
 	if (gtt_storage_hash == NULL)
@@ -998,6 +1475,7 @@ gtt_xact_callback(XactEvent event, void *arg)
 						srel = smgropen(entry->locator,
 										ProcNumberForTempRelations());
 						if (!smgrexists(srel, MAIN_FORKNUM) ||
+							entry->is_sequence ||
 							smgrnblocks(srel, MAIN_FORKNUM) == 0)
 						{
 							smgrdounlinkall(&srel, 1, false);
@@ -1049,6 +1527,14 @@ gtt_xact_callback(XactEvent event, void *arg)
 					gtt_revert_storage(entry);
 					to_deregister = lappend_oid(to_deregister, entry->relid);
 					to_invalidate = lappend_oid(to_invalidate, entry->relid);
+					if (!entry->is_index)
+					{
+						reverted_heaps = lappend_oid(reverted_heaps,
+													 entry->relid);
+						if (OidIsValid(entry->toast_relid))
+							reverted_heaps = lappend_oid(reverted_heaps,
+														 entry->toast_relid);
+					}
 				}
 				if (entry->index_subid != InvalidSubTransactionId)
 				{
@@ -1081,6 +1567,7 @@ gtt_xact_callback(XactEvent event, void *arg)
 	}
 
 	gtt_remove_relids(to_remove);
+	gtt_truncate_dependents(reverted_heaps);
 
 	foreach_oid(relid, to_deregister)
 		gtt_sessions_remove(relid);
@@ -1089,6 +1576,10 @@ gtt_xact_callback(XactEvent event, void *arg)
 	foreach_oid(relid, to_invalidate)
 		RelationCacheInvalidateEntry(relid);
 	list_free(to_invalidate);
+
+#ifdef USE_ASSERT_CHECKING
+	gtt_check_invariants();
+#endif
 
 	/* every entry has now been settled */
 	gtt_xact_state_dirty = false;
@@ -1114,6 +1605,7 @@ gtt_subxact_callback(SubXactEvent event,
 	List	   *to_remove = NIL;
 	List	   *to_invalidate = NIL;
 	List	   *to_deregister = NIL;
+	List	   *reverted_heaps = NIL;
 	ListCell   *lc;
 
 	if (gtt_storage_hash == NULL)
@@ -1180,6 +1672,14 @@ gtt_subxact_callback(SubXactEvent event,
 				gtt_revert_storage(entry);
 				to_deregister = lappend_oid(to_deregister, entry->relid);
 				to_invalidate = lappend_oid(to_invalidate, entry->relid);
+				if (!entry->is_index)
+				{
+					reverted_heaps = lappend_oid(reverted_heaps,
+												 entry->relid);
+					if (OidIsValid(entry->toast_relid))
+						reverted_heaps = lappend_oid(reverted_heaps,
+													 entry->toast_relid);
+				}
 			}
 			if (entry->index_subid == mySubid)
 			{
@@ -1201,6 +1701,7 @@ gtt_subxact_callback(SubXactEvent event,
 	}
 
 	gtt_remove_relids(to_remove);
+	gtt_truncate_dependents(reverted_heaps);
 
 	foreach_oid(relid, to_deregister)
 		gtt_sessions_remove(relid);
@@ -1240,6 +1741,11 @@ gtt_truncate_smgr(GttStorageEntry *entry)
 
 	if (!entry->storage_created)
 		return;
+
+	/* Storage is being emptied; the xid horizon tracking restarts. */
+	entry->oldest_xid = InvalidTransactionId;
+	entry->xid_warned = false;
+	entry->session_relminmxid = InvalidMultiXactId;
 
 	reln = smgropen(entry->locator, ProcNumberForTempRelations());
 
@@ -1967,7 +2473,9 @@ GttResetAllSessionData(void)
 	 * transactional: an abort restores the data through the swap undo, and
 	 * the schedule is simply cancelled.  At commit, an entry whose main fork
 	 * is no longer empty (the same transaction wrote into it after the
-	 * DISCARD) is kept materialized instead.
+	 * DISCARD) is kept materialized instead; sequences are always released,
+	 * since rematerialization reseeds them to their start value, which is
+	 * what DISCARD's reset means anyway.
 	 */
 	hash_seq_init(&status, gtt_storage_hash);
 	while ((entry = (GttStorageEntry *) hash_seq_search(&status)) != NULL)

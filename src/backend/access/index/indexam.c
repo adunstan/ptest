@@ -49,7 +49,9 @@
 #include "access/relscan.h"
 #include "access/tableam.h"
 #include "catalog/index.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_type.h"
+#include "catalog/storage_gtt.h"
 #include "nodes/execnodes.h"
 #include "pgstat.h"
 #include "storage/lmgr.h"
@@ -275,6 +277,13 @@ index_beginscan(Relation heapRelation,
 						RelationGetRelationName(heapRelation))));
 	}
 
+	/*
+	 * Refuse to scan an index on a global temporary table whose heap data has
+	 * aged toward the transaction-ID horizon.  Index scans fetch heap tuples
+	 * for visibility, so gate on the heap relation here at scan start.
+	 */
+	GttPrepareAccess(heapRelation, false);
+
 	scan = index_beginscan_internal(indexRelation, nkeys, norderbys, snapshot, NULL, false);
 
 	/*
@@ -331,6 +340,15 @@ index_beginscan_internal(Relation indexRelation,
 
 	RELATION_CHECKS;
 	CHECK_REL_PROCEDURE(ambeginscan);
+
+	/*
+	 * A GTT index's per-session storage is materialized and built lazily;
+	 * make sure it exists before the AM reads its metapage.  (The parent heap
+	 * is not materialized by this: building over an unmaterialized heap
+	 * yields an empty, structurally valid index.)
+	 */
+	if (RelationIsGlobalTemp(indexRelation))
+		GttPrepareIndexAccess(indexRelation);
 
 	if (!(indexRelation->rd_indam->ampredlocks))
 		PredicateLockRelation(indexRelation, snapshot);
@@ -813,6 +831,16 @@ bool
 index_can_return(Relation indexRelation, int attno)
 {
 	RELATION_CHECKS;
+
+	/*
+	 * An unmaterialized GTT index has no pages for amcanreturn to consult
+	 * (SPGiST reads its metapage, for example); the index is empty, so
+	 * "cannot return" is a safe answer that keeps planning from materializing
+	 * per-session storage.
+	 */
+	if (RelationIsGlobalTemp(indexRelation) &&
+		!GttSessionIndexUsable(RelationGetRelid(indexRelation)))
+		return false;
 
 	/* amcanreturn is optional; assume false if not provided by AM */
 	if (indexRelation->rd_indam->amcanreturn == NULL)

@@ -32,6 +32,7 @@
 #include "catalog/catalog.h"
 #include "catalog/index.h"
 #include "catalog/storage.h"
+#include "catalog/storage_gtt.h"
 #include "catalog/storage_xlog.h"
 #include "commands/progress.h"
 #include "executor/executor.h"
@@ -95,6 +96,9 @@ heapam_fetch_row_version(Relation relation,
 	Buffer		buffer;
 
 	Assert(TTS_IS_BUFFERTUPLE(slot));
+
+	/* Refuse to fetch from a global temporary table whose data has aged out. */
+	GttPrepareAccess(relation, false);
 
 	bslot->base.tupdata.t_self = *tid;
 	if (heap_fetch(relation, snapshot, &bslot->base.tupdata, &buffer, false))
@@ -283,6 +287,12 @@ heapam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
 	tmfd->traversed = false;
 
 	Assert(TTS_IS_BUFFERTUPLE(slot));
+
+	/*
+	 * Refuse to lock rows in a global temporary table whose data has aged
+	 * out.
+	 */
+	GttPrepareAccess(relation, false);
 
 tuple_lock_retry:
 	tuple->t_self = *tid;

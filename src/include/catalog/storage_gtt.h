@@ -16,6 +16,13 @@
 #include "storage/shmem.h"
 #include "utils/rel.h"
 
+/*
+ * GUC: warn this many transactions before a GTT's oldest unfrozen xmin would
+ * reach the cluster CLOG-truncation horizon.  The hard error is fixed at the
+ * horizon itself; see GttPrepareAccess().
+ */
+extern PGDLLIMPORT int global_temp_xid_warn_margin;
+
 extern void GttInitSessionStorage(Relation relation);
 extern void GttEnsureSessionStorage(Relation relation);
 extern void GttSetNewSessionRelfilenumber(Relation relation,
@@ -23,6 +30,30 @@ extern void GttSetNewSessionRelfilenumber(Relation relation,
 extern bool GttHasSessionStorage(Oid relid);
 extern bool GttSessionIndexUsable(Oid relid);
 extern void GttScheduleDropSessionStorage(Oid relid);
+extern void GttPrepareAccessGuts(Relation rel, bool is_insert);
+
+/*
+ * GttPrepareAccess
+ *		Prepare a global temporary table for heap access.
+ *
+ * For writes, materializes the per-session storage if this is the first
+ * genuine data access; for all access, guards against the transaction-ID
+ * wraparound horizon.  Inline wrapper so the heap and index entry points
+ * can call this unconditionally: for anything but a global temporary
+ * table it costs one predictable branch.
+ */
+static inline void
+GttPrepareAccess(Relation rel, bool is_insert)
+{
+	if (RelationIsGlobalTemp(rel))
+		GttPrepareAccessGuts(rel, is_insert);
+}
+extern bool GttGetSessionFrozenXids(Oid relid, TransactionId *relfrozenxid,
+									MultiXactId *relminmxid);
+extern void GttUpdateSessionFrozenXids(Oid relid, TransactionId relfrozenxid,
+									   MultiXactId relminmxid,
+									   bool *frozenxid_updated,
+									   bool *minmulti_updated);
 extern void GttBuildIndexIfNeeded(Relation indexRelation);
 extern void GttMarkIndexBuildDeferred(Relation indexRelation);
 extern void GttPrepareIndexAccess(Relation indexRelation);

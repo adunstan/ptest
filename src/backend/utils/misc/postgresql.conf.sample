@@ -818,6 +818,10 @@
 #gin_pending_list_limit = 4MB
 #createrole_self_grant = ''             # set and/or inherit
 #event_triggers = on
+#global_temp_xid_warn_margin = 100000000        # transactions of head room before
+                                        # warning that global temporary table
+                                        # data is aging toward wraparound;
+                                        # 0 disables the warning
 
 # - Locale and Formatting -
 
