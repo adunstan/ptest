@@ -3,6 +3,7 @@
 TAP_TESTS = 1
 
 EXTRA_INSTALL=src/test/modules/injection_points \
+	contrib/amcheck \
 	contrib/test_decoding
 
 # The injection points are cluster-wide, so disable installcheck
