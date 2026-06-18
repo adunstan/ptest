@@ -1,0 +1,187 @@
+--
+-- Columnstore mixed delta + columnar tests, INSERT...SELECT
+--
+
+-- ===================================================================
+-- Mixed delta + columnar queries
+-- ===================================================================
+CREATE TABLE cs_mixed (id int, val text, num numeric(10,2)) USING columnstore;
+
+-- Columnar data
+INSERT INTO cs_mixed SELECT i, 'col_' || i, (i * 1.5)::numeric(10,2)
+    FROM generate_series(1, 500) i;
+VACUUM cs_mixed;
+
+-- Delta data
+INSERT INTO cs_mixed SELECT i, 'delta_' || i, (i * 2.5)::numeric(10,2)
+    FROM generate_series(501, 600) i;
+
+-- Verify both stores are scanned
+SELECT count(*) AS total FROM cs_mixed;
+SELECT count(*) AS columnar_rows FROM cs_mixed WHERE id <= 500;
+SELECT count(*) AS delta_rows FROM cs_mixed WHERE id > 500;
+
+-- Aggregates spanning both stores
+SELECT sum(num) AS total_sum FROM cs_mixed;
+SELECT min(num) AS total_min, max(num) AS total_max FROM cs_mixed;
+
+-- Deletions in both stores
+DELETE FROM cs_mixed WHERE id = 100;  -- columnar
+DELETE FROM cs_mixed WHERE id = 550;  -- delta
+SELECT count(*) AS after_delete FROM cs_mixed;
+
+-- Verify deleted rows are gone
+SELECT count(*) FROM cs_mixed WHERE id = 100;
+SELECT count(*) FROM cs_mixed WHERE id = 550;
+
+-- Remaining rows still correct
+SELECT id, val, num FROM cs_mixed WHERE id IN (99, 101, 549, 551) ORDER BY id;
+
+DROP TABLE cs_mixed;
+
+-- ===================================================================
+-- INSERT...SELECT from columnstore to columnstore
+-- ===================================================================
+CREATE TABLE cs_src (id int, val text, num numeric(10,2)) USING columnstore;
+INSERT INTO cs_src SELECT i, 'src_' || i, (i * 0.5)::numeric(10,2)
+    FROM generate_series(1, 500) i;
+VACUUM cs_src;
+
+-- Insert frozen columnar data into new CS table
+CREATE TABLE cs_dst (id int, val text, num numeric(10,2)) USING columnstore;
+INSERT INTO cs_dst SELECT * FROM cs_src;
+SELECT count(*) AS dst_count FROM cs_dst;
+
+-- Verify data integrity
+SELECT count(*) FROM (
+    SELECT * FROM cs_src EXCEPT SELECT * FROM cs_dst
+) diff;
+
+DROP TABLE cs_dst;
+
+-- Insert with filter
+CREATE TABLE cs_dst2 (id int, val text, num numeric(10,2)) USING columnstore;
+INSERT INTO cs_dst2 SELECT * FROM cs_src WHERE id <= 100;
+SELECT count(*) AS dst2_count FROM cs_dst2;
+DROP TABLE cs_dst2;
+
+-- Insert from mixed delta + columnar source
+INSERT INTO cs_src SELECT i, 'delta_' || i, (i * 0.7)::numeric(10,2)
+    FROM generate_series(501, 600) i;
+CREATE TABLE cs_dst3 (id int, val text, num numeric(10,2)) USING columnstore;
+INSERT INTO cs_dst3 SELECT * FROM cs_src;
+SELECT count(*) AS dst3_count FROM cs_dst3;
+DROP TABLE cs_dst3;
+
+DROP TABLE cs_src;
+
+-- ===================================================================
+-- INSERT...SELECT with all-NULL rows (regression for all-NULL bug)
+-- ===================================================================
+CREATE TABLE cs_allnull_src (id int, a int, b text, c numeric) USING columnstore;
+-- All nullable columns NULL except id
+INSERT INTO cs_allnull_src SELECT i, NULL, NULL, NULL FROM generate_series(1, 500) i;
+VACUUM cs_allnull_src;
+
+-- Verify the all-NULL data reads back correctly
+SELECT count(*) AS total FROM cs_allnull_src;
+SELECT count(a) AS a_nonnull, count(b) AS b_nonnull, count(c) AS c_nonnull
+    FROM cs_allnull_src;
+
+-- INSERT...SELECT from all-NULL source
+CREATE TABLE cs_allnull_dst (id int, a int, b text, c numeric) USING columnstore;
+INSERT INTO cs_allnull_dst SELECT * FROM cs_allnull_src;
+SELECT count(*) AS dst_count FROM cs_allnull_dst;
+SELECT count(a) AS a_nonnull FROM cs_allnull_dst;
+
+DROP TABLE cs_allnull_src;
+DROP TABLE cs_allnull_dst;
+
+-- ===================================================================
+-- INSERT...SELECT with multiple data types
+-- ===================================================================
+CREATE TABLE cs_multi_src (
+    id int,
+    i2 smallint,
+    i4 int,
+    i8 bigint,
+    f4 float4,
+    f8 float8,
+    t text,
+    n numeric(12,3),
+    d date,
+    b bool
+) USING columnstore;
+
+INSERT INTO cs_multi_src SELECT
+    i,
+    (i % 100)::smallint,
+    i * 7,
+    i::bigint * 1000000,
+    (i * 1.1)::float4,
+    (i * 2.2)::float8,
+    'text_' || i,
+    (i * 0.123)::numeric(12,3),
+    '2020-01-01'::date + i,
+    (i % 2 = 0)
+    FROM generate_series(1, 500) i;
+VACUUM cs_multi_src;
+
+CREATE TABLE cs_multi_dst (LIKE cs_multi_src) USING columnstore;
+INSERT INTO cs_multi_dst SELECT * FROM cs_multi_src;
+VACUUM cs_multi_dst;
+
+-- Verify round-trip through two freeze cycles
+SELECT count(*) FROM (
+    SELECT * FROM cs_multi_src EXCEPT SELECT * FROM cs_multi_dst
+) diff;
+
+-- Spot check
+SELECT id, i2, i4, i8, t, n, d, b FROM cs_multi_dst WHERE id = 1;
+SELECT id, i2, i4, i8, t, n, d, b FROM cs_multi_dst WHERE id = 500;
+
+DROP TABLE cs_multi_src;
+DROP TABLE cs_multi_dst;
+
+-- ===================================================================
+-- ALTER TABLE ADD COLUMN over existing row groups
+--
+-- Row groups written before the column existed have no chunk for it;
+-- reads must materialize the column's missing value (the ADD COLUMN
+-- DEFAULT, or NULL) instead of indexing past the stored descriptors.
+-- ===================================================================
+CREATE TABLE cs_addcol (a int, b text) USING columnstore;
+INSERT INTO cs_addcol SELECT i, 'old_' || i FROM generate_series(1, 500) i;
+VACUUM cs_addcol;
+ALTER TABLE cs_addcol ADD COLUMN c int;
+ALTER TABLE cs_addcol ADD COLUMN d text DEFAULT 'filled';
+INSERT INTO cs_addcol VALUES (501, 'new', 42, 'explicit');
+SELECT a, b, c, d FROM cs_addcol WHERE a IN (1, 250, 501) ORDER BY a;
+SELECT count(*) FROM cs_addcol WHERE c IS NULL;
+SELECT count(*) FROM cs_addcol WHERE d = 'filled';
+-- and after the next compaction folds the new columns in
+VACUUM cs_addcol;
+SELECT a, b, c, d FROM cs_addcol WHERE a IN (1, 250, 501) ORDER BY a;
+SELECT count(*) FROM cs_addcol WHERE d = 'filled';
+DROP TABLE cs_addcol;
+-- ===================================================================
+-- Table rewrite over columnar data
+--
+-- A volatile column default forces ATRewriteTable to scan the relation
+-- through the raw table-AM interface, whose per-row expression context
+-- is reset between rows; the lazy column cache must survive that (it
+-- once dangled and crashed here).  Each row must get its own evaluated
+-- default, and a type-changing rewrite must round-trip all rows.
+-- ===================================================================
+CREATE TABLE cs_rewrite (id int, grp text) USING columnstore;
+INSERT INTO cs_rewrite SELECT g, 'g' || (g % 5) FROM generate_series(1, 100000) g;
+VACUUM cs_rewrite;
+ALTER TABLE cs_rewrite ADD COLUMN r double precision DEFAULT random();
+SELECT count(*) AS rows_kept, count(DISTINCT r) > 90000 AS defaults_distinct,
+       count(*) FILTER (WHERE r IS NULL) AS null_defaults
+  FROM cs_rewrite;
+ALTER TABLE cs_rewrite ALTER COLUMN id TYPE bigint;
+SELECT count(*), min(id), max(id) FROM cs_rewrite;
+VACUUM cs_rewrite;
+SELECT count(*), min(id), max(id) FROM cs_rewrite;
+DROP TABLE cs_rewrite;

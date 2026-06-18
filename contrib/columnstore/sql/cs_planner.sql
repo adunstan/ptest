@@ -1,0 +1,80 @@
+--
+-- Columnstore planner integration tests.
+--
+-- Verifies the planner consults the columnstore AM's cost factors,
+-- index_fetch_cost, allvisfrac reporting, and parallel worker
+-- estimation.  Uses EXPLAIN (COSTS OFF) so the assertions survive
+-- small shifts in cost parameters.
+--
+
+-- ===================================================================
+-- Index Only Scan on frozen row groups
+-- ===================================================================
+-- cs_relation_estimate_size reports allvisfrac=0 because the AM does
+-- not maintain a visibility map for columnar virtual TIDs.  The
+-- planner still picks Index Only Scan for covering queries because
+-- IOS over a covering index is cheaper than Index Scan even without
+-- the heap-skip optimisation; execution falls through to
+-- cs_index_fetch_tuple for the per-tuple visibility check on every
+-- columnar row.
+CREATE TABLE cs_planner_ios (id int, v int) USING columnstore;
+INSERT INTO cs_planner_ios SELECT i, i * 2 FROM generate_series(1, 10000) i;
+CREATE INDEX ON cs_planner_ios (id);
+VACUUM cs_planner_ios;
+ANALYZE cs_planner_ios;
+
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM cs_planner_ios WHERE id = 42;
+RESET enable_seqscan;
+
+DROP TABLE cs_planner_ios;
+
+-- ===================================================================
+-- Index fetch cost: scan path choice tracks selectivity
+-- ===================================================================
+-- index_fetch_cost reports a higher per-fetch cost than heap because
+-- a columnar index fetch decompresses a whole row group per visit.
+-- A highly selective query should choose Index Scan; a broad query
+-- should fall back to Seq Scan because the per-fetch cost piles up.
+CREATE TABLE cs_planner_cost (id int, v int) USING columnstore;
+INSERT INTO cs_planner_cost SELECT i, i FROM generate_series(1, 50000) i;
+CREATE INDEX ON cs_planner_cost (id);
+VACUUM cs_planner_cost;
+ANALYZE cs_planner_cost;
+
+-- Selective lookup: Index Scan wins.
+EXPLAIN (COSTS OFF)
+SELECT v FROM cs_planner_cost WHERE id = 100;
+
+-- Broad filter: Seq Scan wins.
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM cs_planner_cost WHERE id > 0;
+
+DROP TABLE cs_planner_cost;
+
+-- ===================================================================
+-- Parallel worker count is capped by row group count
+-- ===================================================================
+-- compute_parallel_workers returns 0 when the table has at most one
+-- row group, so a small columnstore table should never spawn a
+-- parallel seq scan even when parallel cost parameters are forced
+-- down to zero.
+CREATE TABLE cs_planner_par (id int, v int) USING columnstore;
+INSERT INTO cs_planner_par SELECT i, i FROM generate_series(1, 10000) i;
+VACUUM cs_planner_par;
+
+SET max_parallel_workers_per_gather = 4;
+SET min_parallel_table_scan_size = 0;
+SET parallel_tuple_cost = 0;
+SET parallel_setup_cost = 0;
+
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM cs_planner_par;
+
+RESET max_parallel_workers_per_gather;
+RESET min_parallel_table_scan_size;
+RESET parallel_tuple_cost;
+RESET parallel_setup_cost;
+
+DROP TABLE cs_planner_par;

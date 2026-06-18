@@ -1,0 +1,28 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_begin s1_snap s2_delete s2_abort_delete s2_index s1_idxscan s1_commit s2_count
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_snap: SELECT count(*) FROM cs_idxvis;
+count
+-----
+  200
+(1 row)
+
+step s2_delete: DELETE FROM cs_idxvis WHERE id = 100;
+step s2_abort_delete: BEGIN; DELETE FROM cs_idxvis WHERE id = 150; ROLLBACK;
+step s2_index: CREATE INDEX cs_idxvis_id ON cs_idxvis (id);
+step s1_idxscan: SET LOCAL enable_seqscan = off;
+                    SELECT count(*) FROM cs_idxvis WHERE id BETWEEN 1 AND 200;
+count
+-----
+  200
+(1 row)
+
+step s1_commit: COMMIT;
+step s2_count: SET LOCAL enable_seqscan = off;
+                    SELECT count(*) FROM cs_idxvis WHERE id BETWEEN 1 AND 200;
+count
+-----
+  199
+(1 row)
+

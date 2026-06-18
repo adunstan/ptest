@@ -1,0 +1,5 @@
+comment = 'columnar storage table access method'
+default_version = '1.0'
+module_pathname = '$libdir/columnstore'
+relocatable = false
+trusted = false

@@ -1,0 +1,155 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s0_vacuum s2_begin s1_begin s1_delete s1_commit s2_count s2_count_all s2_commit
+step s0_vacuum: VACUUM cs_vis;
+step s2_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_begin: BEGIN;
+step s1_delete: DELETE FROM cs_vis WHERE id BETWEEN 100 AND 110;
+step s1_commit: COMMIT;
+step s2_count: SELECT count(*) AS visible FROM cs_vis WHERE id BETWEEN 100 AND 110;
+visible
+-------
+      0
+(1 row)
+
+step s2_count_all: SELECT count(*) AS total FROM cs_vis;
+total
+-----
+  489
+(1 row)
+
+step s2_commit: COMMIT;
+
+starting permutation: s0_vacuum s1_begin s1_delete s1_commit s2_begin s2_count s2_count_all s2_commit
+step s0_vacuum: VACUUM cs_vis;
+step s1_begin: BEGIN;
+step s1_delete: DELETE FROM cs_vis WHERE id BETWEEN 100 AND 110;
+step s1_commit: COMMIT;
+step s2_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s2_count: SELECT count(*) AS visible FROM cs_vis WHERE id BETWEEN 100 AND 110;
+visible
+-------
+      0
+(1 row)
+
+step s2_count_all: SELECT count(*) AS total FROM cs_vis;
+total
+-----
+  489
+(1 row)
+
+step s2_commit: COMMIT;
+
+starting permutation: s0_vacuum s1_begin s1_delete s1_rollback s2_begin s2_count s2_count_all s2_commit
+step s0_vacuum: VACUUM cs_vis;
+step s1_begin: BEGIN;
+step s1_delete: DELETE FROM cs_vis WHERE id BETWEEN 100 AND 110;
+step s1_rollback: ROLLBACK;
+step s2_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s2_count: SELECT count(*) AS visible FROM cs_vis WHERE id BETWEEN 100 AND 110;
+visible
+-------
+     11
+(1 row)
+
+step s2_count_all: SELECT count(*) AS total FROM cs_vis;
+total
+-----
+  500
+(1 row)
+
+step s2_commit: COMMIT;
+
+starting permutation: s0_vacuum s2_begin s2_count s1_begin s1_delete s1_commit s2_count s2_commit
+step s0_vacuum: VACUUM cs_vis;
+step s2_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s2_count: SELECT count(*) AS visible FROM cs_vis WHERE id BETWEEN 100 AND 110;
+visible
+-------
+     11
+(1 row)
+
+step s1_begin: BEGIN;
+step s1_delete: DELETE FROM cs_vis WHERE id BETWEEN 100 AND 110;
+step s1_commit: COMMIT;
+step s2_count: SELECT count(*) AS visible FROM cs_vis WHERE id BETWEEN 100 AND 110;
+visible
+-------
+     11
+(1 row)
+
+step s2_commit: COMMIT;
+
+starting permutation: s0_vacuum s2_begin s2_read s1_begin s1_update s1_commit s2_read s2_count s2_commit
+step s0_vacuum: VACUUM cs_vis;
+step s2_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s2_read: SELECT id, val FROM cs_vis WHERE id IN (100, 105, 110) ORDER BY id;
+ id|val    
+---+-------
+100|row_100
+105|row_105
+110|row_110
+(3 rows)
+
+step s1_begin: BEGIN;
+step s1_update: UPDATE cs_vis SET val = 'new_' || id WHERE id BETWEEN 100 AND 110;
+step s1_commit: COMMIT;
+step s2_read: SELECT id, val FROM cs_vis WHERE id IN (100, 105, 110) ORDER BY id;
+ id|val    
+---+-------
+100|row_100
+105|row_105
+110|row_110
+(3 rows)
+
+step s2_count: SELECT count(*) AS visible FROM cs_vis WHERE id BETWEEN 100 AND 110;
+visible
+-------
+     11
+(1 row)
+
+step s2_commit: COMMIT;
+
+starting permutation: s0_vacuum s1_begin s1_update s1_commit s2_begin s2_read s2_count s2_commit
+step s0_vacuum: VACUUM cs_vis;
+step s1_begin: BEGIN;
+step s1_update: UPDATE cs_vis SET val = 'new_' || id WHERE id BETWEEN 100 AND 110;
+step s1_commit: COMMIT;
+step s2_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s2_read: SELECT id, val FROM cs_vis WHERE id IN (100, 105, 110) ORDER BY id;
+ id|val    
+---+-------
+100|new_100
+105|new_105
+110|new_110
+(3 rows)
+
+step s2_count: SELECT count(*) AS visible FROM cs_vis WHERE id BETWEEN 100 AND 110;
+visible
+-------
+     11
+(1 row)
+
+step s2_commit: COMMIT;
+
+starting permutation: s0_vacuum s1_begin s1_update s1_rollback s2_begin s2_read s2_count s2_commit
+step s0_vacuum: VACUUM cs_vis;
+step s1_begin: BEGIN;
+step s1_update: UPDATE cs_vis SET val = 'new_' || id WHERE id BETWEEN 100 AND 110;
+step s1_rollback: ROLLBACK;
+step s2_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s2_read: SELECT id, val FROM cs_vis WHERE id IN (100, 105, 110) ORDER BY id;
+ id|val    
+---+-------
+100|row_100
+105|row_105
+110|row_110
+(3 rows)
+
+step s2_count: SELECT count(*) AS visible FROM cs_vis WHERE id BETWEEN 100 AND 110;
+visible
+-------
+     11
+(1 row)
+
+step s2_commit: COMMIT;

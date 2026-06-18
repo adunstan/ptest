@@ -1,0 +1,32 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_vacuum s2_insert s2_count
+step s1_vacuum: VACUUM cs_vc;
+step s2_insert: INSERT INTO cs_vc SELECT i, 'new_' || i FROM generate_series(101, 110) i;
+step s2_count: SELECT count(*) AS total FROM cs_vc;
+total
+-----
+  110
+(1 row)
+
+
+starting permutation: s2_insert s1_vacuum s2_count
+step s2_insert: INSERT INTO cs_vc SELECT i, 'new_' || i FROM generate_series(101, 110) i;
+step s1_vacuum: VACUUM cs_vc;
+step s2_count: SELECT count(*) AS total FROM cs_vc;
+total
+-----
+  110
+(1 row)
+
+
+starting permutation: s2_insert s1_vacuum s2_insert s2_count
+step s2_insert: INSERT INTO cs_vc SELECT i, 'new_' || i FROM generate_series(101, 110) i;
+step s1_vacuum: VACUUM cs_vc;
+step s2_insert: INSERT INTO cs_vc SELECT i, 'new_' || i FROM generate_series(101, 110) i;
+step s2_count: SELECT count(*) AS total FROM cs_vc;
+total
+-----
+  120
+(1 row)
+

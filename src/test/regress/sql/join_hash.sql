@@ -625,3 +625,44 @@ lateral (select t1.fivethous, i4.f1 from tenk1 t1 join int4_tbl i4
          on t1.fivethous = i4.f1+i8.q2 order by 1,2) ss;
 
 rollback;
+
+-- A bloom filter must not be pushed down from a parallel-aware hash: only
+-- the serial hash build populates the filter, so a pushed filter would
+-- remain empty and reject every probe row (assert-enabled builds fail an
+-- assertion in ExecHashTableCreate instead).  Build a parallel hash join
+-- whose outer subtree contains a non-parallel-aware scan that would
+-- otherwise be an eligible recipient: the index scan on the inner side of
+-- a nestloop (the BETWEEN join clause is intentionally not hashable, so
+-- the nestloop is the only way to perform that join).  The bloom-enabled
+-- count must match the bloom-disabled one.
+begin;
+create table bloom_par_nl as select i as a from generate_series(1, 1000) i;
+create table bloom_par_idx as select i as a, i % 100 as b
+  from generate_series(1, 100000) i;
+create index bloom_par_idx_a on bloom_par_idx(a);
+create table bloom_par_build as select i % 100 as b
+  from generate_series(1, 80000) i;
+alter table bloom_par_nl set (parallel_workers = 2);
+alter table bloom_par_build set (parallel_workers = 2);
+analyze bloom_par_nl;
+analyze bloom_par_idx;
+analyze bloom_par_build;
+set local min_parallel_table_scan_size = 0;
+set local parallel_setup_cost = 0;
+set local parallel_tuple_cost = 0;
+set local max_parallel_workers_per_gather = 2;
+set local enable_mergejoin = off;
+set local enable_memoize = off;
+set local enable_hashjoin_bloom = on;
+explain (costs off)
+  select count(*) from bloom_par_nl o
+    join bloom_par_idx i on i.a between o.a and o.a
+    join bloom_par_build h on h.b = i.b;
+select count(*) from bloom_par_nl o
+  join bloom_par_idx i on i.a between o.a and o.a
+  join bloom_par_build h on h.b = i.b;
+set local enable_hashjoin_bloom = off;
+select count(*) from bloom_par_nl o
+  join bloom_par_idx i on i.a between o.a and o.a
+  join bloom_par_build h on h.b = i.b;
+rollback;

@@ -1,0 +1,30 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s0_vacuum s1_begin s1_delete s2_insert s1_abort s2_count
+step s0_vacuum: VACUUM cs_uniq;
+step s1_begin: BEGIN;
+step s1_delete: DELETE FROM cs_uniq WHERE id = 42;
+step s2_insert: INSERT INTO cs_uniq VALUES (42, 'replacement'); <waiting ...>
+step s1_abort: ROLLBACK;
+step s2_insert: <... completed>
+ERROR:  duplicate key value violates unique constraint "cs_uniq_id"
+step s2_count: SELECT count(*) FROM cs_uniq WHERE id = 42;
+count
+-----
+    1
+(1 row)
+
+
+starting permutation: s0_vacuum s1_begin s1_delete s2_insert s1_commit s2_count
+step s0_vacuum: VACUUM cs_uniq;
+step s1_begin: BEGIN;
+step s1_delete: DELETE FROM cs_uniq WHERE id = 42;
+step s2_insert: INSERT INTO cs_uniq VALUES (42, 'replacement'); <waiting ...>
+step s1_commit: COMMIT;
+step s2_insert: <... completed>
+step s2_count: SELECT count(*) FROM cs_uniq WHERE id = 42;
+count
+-----
+    1
+(1 row)
+

@@ -1,0 +1,233 @@
+--
+-- Columnstore dictionary encoding edge cases
+--
+-- ===================================================================
+-- Index width boundary: 1-byte vs 2-byte dictionary index
+-- ===================================================================
+-- 254 distinct values: should use 1-byte index (254 + possible NULL < 256)
+CREATE TABLE cs_dict_254 (id int, v text) USING columnstore;
+INSERT INTO cs_dict_254 SELECT i, 'val_' || lpad((i % 254)::text, 4, '0')
+    FROM generate_series(1, 1000) i;
+VACUUM cs_dict_254;
+SELECT count(*) AS cnt FROM cs_dict_254;
+ cnt  
+------
+ 1000
+(1 row)
+
+SELECT count(DISTINCT v) AS ndistinct FROM cs_dict_254;
+ ndistinct 
+-----------
+       254
+(1 row)
+
+-- Verify first and last distinct values
+SELECT DISTINCT v FROM cs_dict_254 ORDER BY v LIMIT 3;
+    v     
+----------
+ val_0000
+ val_0001
+ val_0002
+(3 rows)
+
+SELECT DISTINCT v FROM cs_dict_254 ORDER BY v DESC LIMIT 3;
+    v     
+----------
+ val_0253
+ val_0252
+ val_0251
+(3 rows)
+
+-- Point lookups
+SELECT count(*) FROM cs_dict_254 WHERE v = 'val_0000';
+ count 
+-------
+     3
+(1 row)
+
+SELECT count(*) FROM cs_dict_254 WHERE v = 'val_0253';
+ count 
+-------
+     3
+(1 row)
+
+DROP TABLE cs_dict_254;
+-- 256 distinct values: forces 2-byte index (256 > 255)
+CREATE TABLE cs_dict_256 (id int, v text) USING columnstore;
+INSERT INTO cs_dict_256 SELECT i, 'val_' || lpad((i % 256)::text, 4, '0')
+    FROM generate_series(1, 1024) i;
+VACUUM cs_dict_256;
+SELECT count(*) AS cnt FROM cs_dict_256;
+ cnt  
+------
+ 1024
+(1 row)
+
+SELECT count(DISTINCT v) AS ndistinct FROM cs_dict_256;
+ ndistinct 
+-----------
+       256
+(1 row)
+
+SELECT DISTINCT v FROM cs_dict_256 ORDER BY v LIMIT 3;
+    v     
+----------
+ val_0000
+ val_0001
+ val_0002
+(3 rows)
+
+SELECT DISTINCT v FROM cs_dict_256 ORDER BY v DESC LIMIT 3;
+    v     
+----------
+ val_0255
+ val_0254
+ val_0253
+(3 rows)
+
+DROP TABLE cs_dict_256;
+-- 255 distinct values with NULLs: NULL uses a sentinel index
+-- 255 + NULL sentinel = 256 entries → forces 2-byte index
+CREATE TABLE cs_dict_255_null (id int, v text) USING columnstore;
+INSERT INTO cs_dict_255_null SELECT i,
+    CASE WHEN i % 10 = 0 THEN NULL ELSE 'val_' || lpad((i % 255)::text, 4, '0') END
+    FROM generate_series(1, 1000) i;
+VACUUM cs_dict_255_null;
+SELECT count(*) AS total, count(v) AS nonnull FROM cs_dict_255_null;
+ total | nonnull 
+-------+---------
+  1000 |     900
+(1 row)
+
+SELECT count(DISTINCT v) AS ndistinct FROM cs_dict_255_null;
+ ndistinct 
+-----------
+       255
+(1 row)
+
+-- Verify NULLs survived
+SELECT count(*) AS null_count FROM cs_dict_255_null WHERE v IS NULL;
+ null_count 
+------------
+        100
+(1 row)
+
+DROP TABLE cs_dict_255_null;
+-- ===================================================================
+-- Varlena with NULLs: text column, 50 distinct strings, 20% NULLs
+-- ===================================================================
+CREATE TABLE cs_dict_varlena (id int, v text) USING columnstore;
+INSERT INTO cs_dict_varlena SELECT i,
+    CASE WHEN i % 5 = 0 THEN NULL
+         ELSE 'category_' || lpad((i % 50)::text, 3, '0')
+    END FROM generate_series(1, 1000) i;
+VACUUM cs_dict_varlena;
+SELECT count(*) AS total, count(v) AS nonnull FROM cs_dict_varlena;
+ total | nonnull 
+-------+---------
+  1000 |     800
+(1 row)
+
+SELECT count(DISTINCT v) AS ndistinct FROM cs_dict_varlena;
+ ndistinct 
+-----------
+        40
+(1 row)
+
+-- Verify NULL and non-NULL values
+SELECT id, v FROM cs_dict_varlena WHERE id IN (1, 5, 10, 50) ORDER BY id;
+ id |      v       
+----+--------------
+  1 | category_001
+  5 | 
+ 10 | 
+ 50 | 
+(4 rows)
+
+-- Aggregate on dictionary column
+SELECT min(v), max(v) FROM cs_dict_varlena;
+     min      |     max      
+--------------+--------------
+ category_001 | category_049
+(1 row)
+
+DROP TABLE cs_dict_varlena;
+-- ===================================================================
+-- Dictionary with fixed-width by-value types (int): should NOT use dict
+-- (FOR encoding is preferred for integers)
+-- ===================================================================
+CREATE TABLE cs_dict_int (id int, v int) USING columnstore;
+INSERT INTO cs_dict_int SELECT i, i % 10 FROM generate_series(1, 500) i;
+VACUUM cs_dict_int;
+-- Should still work correctly regardless of encoding chosen
+SELECT count(*) AS cnt, count(DISTINCT v) AS ndistinct FROM cs_dict_int;
+ cnt | ndistinct 
+-----+-----------
+ 500 |        10
+(1 row)
+
+SELECT min(v), max(v) FROM cs_dict_int;
+ min | max 
+-----+-----
+   0 |   9
+(1 row)
+
+DROP TABLE cs_dict_int;
+-- ===================================================================
+-- Dictionary with long varlena values
+-- ===================================================================
+CREATE TABLE cs_dict_long (id int, v text) USING columnstore;
+INSERT INTO cs_dict_long SELECT i,
+    'long_prefix_' || repeat('x', 100) || '_suffix_' || lpad((i % 30)::text, 3, '0')
+    FROM generate_series(1, 500) i;
+VACUUM cs_dict_long;
+SELECT count(*) AS cnt FROM cs_dict_long;
+ cnt 
+-----
+ 500
+(1 row)
+
+SELECT count(DISTINCT v) AS ndistinct FROM cs_dict_long;
+ ndistinct 
+-----------
+        30
+(1 row)
+
+-- Verify long values survive round-trip
+SELECT id, length(v) AS vlen, left(v, 15) AS prefix, right(v, 10) AS suffix
+    FROM cs_dict_long WHERE id IN (1, 30, 500) ORDER BY id;
+ id  | vlen |     prefix      |   suffix   
+-----+------+-----------------+------------
+   1 |  123 | long_prefix_xxx | suffix_001
+  30 |  123 | long_prefix_xxx | suffix_000
+ 500 |  123 | long_prefix_xxx | suffix_020
+(3 rows)
+
+DROP TABLE cs_dict_long;
+-- ===================================================================
+-- Too many distinct values: should fall back to plain/LZ4
+-- ===================================================================
+CREATE TABLE cs_dict_toomany (id int, v text) USING columnstore;
+-- All unique strings → more than 25% distinct → no dictionary
+INSERT INTO cs_dict_toomany SELECT i, md5(i::text) FROM generate_series(1, 500) i;
+VACUUM cs_dict_toomany;
+SELECT count(*) AS cnt FROM cs_dict_toomany;
+ cnt 
+-----
+ 500
+(1 row)
+
+-- Verify data integrity
+SELECT id, v FROM cs_dict_toomany WHERE id = 1;
+ id |                v                 
+----+----------------------------------
+  1 | c4ca4238a0b923820dcc509a6f75849b
+(1 row)
+
+SELECT id, v FROM cs_dict_toomany WHERE id = 500;
+ id  |                v                 
+-----+----------------------------------
+ 500 | cee631121c2ec9232f3a2f028ad5c89b
+(1 row)
+
+DROP TABLE cs_dict_toomany;

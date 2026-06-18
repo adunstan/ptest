@@ -1,0 +1,159 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_begin s1_lock s2_lock_nowait s1_commit
+step s1_begin: BEGIN;
+step s1_lock: SELECT id FROM cs_locks WHERE id = 1 FOR UPDATE;
+id
+--
+ 1
+(1 row)
+
+step s2_lock_nowait: SELECT id FROM cs_locks WHERE id = 1 FOR UPDATE NOWAIT;
+ERROR:  could not obtain lock on row in relation "cs_locks"
+step s1_commit: COMMIT;
+
+starting permutation: s1_begin s1_lock s2_lock_skip s1_commit
+step s1_begin: BEGIN;
+step s1_lock: SELECT id FROM cs_locks WHERE id = 1 FOR UPDATE;
+id
+--
+ 1
+(1 row)
+
+step s2_lock_skip: SELECT id FROM cs_locks WHERE id = 1 FOR UPDATE SKIP LOCKED;
+id
+--
+(0 rows)
+
+step s1_commit: COMMIT;
+
+starting permutation: s1_begin s1_lock s2_delete s1_commit s2_count
+step s1_begin: BEGIN;
+step s1_lock: SELECT id FROM cs_locks WHERE id = 1 FOR UPDATE;
+id
+--
+ 1
+(1 row)
+
+step s2_delete: DELETE FROM cs_locks WHERE id = 1; <waiting ...>
+step s1_commit: COMMIT;
+step s2_delete: <... completed>
+step s2_count: SELECT count(*) FROM cs_locks;
+count
+-----
+    9
+(1 row)
+
+
+starting permutation: s1_begin s1_delete s2_delete s1_commit s2_count
+step s1_begin: BEGIN;
+step s1_delete: DELETE FROM cs_locks WHERE id = 1;
+step s2_delete: DELETE FROM cs_locks WHERE id = 1; <waiting ...>
+step s1_commit: COMMIT;
+step s2_delete: <... completed>
+step s2_count: SELECT count(*) FROM cs_locks;
+count
+-----
+    9
+(1 row)
+
+
+starting permutation: s1_begin s1_keyshare s2_begin s2_keyshare s1_commit s2_commit
+step s1_begin: BEGIN;
+step s1_keyshare: SELECT id FROM cs_locks WHERE id = 1 FOR KEY SHARE;
+id
+--
+ 1
+(1 row)
+
+step s2_begin: BEGIN;
+step s2_keyshare: SELECT id FROM cs_locks WHERE id = 1 FOR KEY SHARE; <waiting ...>
+step s1_commit: COMMIT;
+step s2_keyshare: <... completed>
+id
+--
+ 1
+(1 row)
+
+step s2_commit: COMMIT;
+
+starting permutation: s0_vacuum s1_begin s1_lock s2_lock_nowait s1_commit
+step s0_vacuum: VACUUM cs_locks;
+step s1_begin: BEGIN;
+step s1_lock: SELECT id FROM cs_locks WHERE id = 1 FOR UPDATE;
+id
+--
+ 1
+(1 row)
+
+step s2_lock_nowait: SELECT id FROM cs_locks WHERE id = 1 FOR UPDATE NOWAIT;
+ERROR:  could not obtain lock on row in relation "cs_locks"
+step s1_commit: COMMIT;
+
+starting permutation: s0_vacuum s1_begin s1_lock s2_lock_skip s1_commit
+step s0_vacuum: VACUUM cs_locks;
+step s1_begin: BEGIN;
+step s1_lock: SELECT id FROM cs_locks WHERE id = 1 FOR UPDATE;
+id
+--
+ 1
+(1 row)
+
+step s2_lock_skip: SELECT id FROM cs_locks WHERE id = 1 FOR UPDATE SKIP LOCKED;
+id
+--
+(0 rows)
+
+step s1_commit: COMMIT;
+
+starting permutation: s0_vacuum s1_begin s1_lock s2_delete s1_commit s2_count
+step s0_vacuum: VACUUM cs_locks;
+step s1_begin: BEGIN;
+step s1_lock: SELECT id FROM cs_locks WHERE id = 1 FOR UPDATE;
+id
+--
+ 1
+(1 row)
+
+step s2_delete: DELETE FROM cs_locks WHERE id = 1; <waiting ...>
+step s1_commit: COMMIT;
+step s2_delete: <... completed>
+step s2_count: SELECT count(*) FROM cs_locks;
+count
+-----
+    9
+(1 row)
+
+
+starting permutation: s0_vacuum s1_begin s1_delete s2_delete s1_commit s2_count
+step s0_vacuum: VACUUM cs_locks;
+step s1_begin: BEGIN;
+step s1_delete: DELETE FROM cs_locks WHERE id = 1;
+step s2_delete: DELETE FROM cs_locks WHERE id = 1; <waiting ...>
+step s1_commit: COMMIT;
+step s2_delete: <... completed>
+step s2_count: SELECT count(*) FROM cs_locks;
+count
+-----
+    9
+(1 row)
+
+
+starting permutation: s0_vacuum s1_begin s1_keyshare s2_begin s2_keyshare s1_commit s2_commit
+step s0_vacuum: VACUUM cs_locks;
+step s1_begin: BEGIN;
+step s1_keyshare: SELECT id FROM cs_locks WHERE id = 1 FOR KEY SHARE;
+id
+--
+ 1
+(1 row)
+
+step s2_begin: BEGIN;
+step s2_keyshare: SELECT id FROM cs_locks WHERE id = 1 FOR KEY SHARE;
+id
+--
+ 1
+(1 row)
+
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;

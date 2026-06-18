@@ -3891,3 +3891,49 @@ SELECT COUNT(*) FROM onek t1 LEFT JOIN tenk1 t2
     ON (t2.thousand = t1.tenthous OR t2.thousand = t1.thousand);
 SELECT COUNT(*) FROM onek t1 LEFT JOIN tenk1 t2
     ON (t2.thousand = t1.tenthous OR t2.thousand = t1.thousand);
+
+--
+-- Pushed-down hashjoin bloom filters must not sit below nodes that replay
+-- buffered output on rescan (Sort, Material, Memoize) when the producing
+-- join's hash side can be rebuilt with different contents: the buffered
+-- rows were pruned by the previous filter, so rows the new filter would
+-- pass go missing.  The semi-join below forces the parameterized side to
+-- be the hash side, and the Memoize above the would-be recipient index
+-- scan keeps its cache across the lateral rescans.  The bloom-enabled
+-- count must match the bloom-disabled one.
+--
+begin;
+create table bloom_resc_drv as select i as k from generate_series(1, 5) i;
+create table bloom_resc_o as select (i % 10) + 1 as j
+  from generate_series(1, 40) i;
+create table bloom_resc_big as select i as j, i % 50 as b
+  from generate_series(1, 10000) i;
+create index bloom_resc_big_j on bloom_resc_big(j);
+-- disjoint b ranges per k, so each driver row needs different probe rows
+create table bloom_resc_sel as select (i / 10) % 5 + 1 as k, i % 50 as b
+  from generate_series(0, 49) i;
+analyze bloom_resc_drv;
+analyze bloom_resc_o;
+analyze bloom_resc_big;
+analyze bloom_resc_sel;
+set local enable_mergejoin = off;
+set local max_parallel_workers_per_gather = 0;
+set local enable_hashjoin_bloom = on;
+explain (costs off)
+select count(*) from bloom_resc_drv x,
+  lateral (select * from bloom_resc_o o join bloom_resc_big t1 on t1.j = o.j
+           where exists (select 1 from bloom_resc_sel t3
+                         where t3.b = t1.b and t3.k = x.k)
+           offset 0) sub;
+select count(*) from bloom_resc_drv x,
+  lateral (select * from bloom_resc_o o join bloom_resc_big t1 on t1.j = o.j
+           where exists (select 1 from bloom_resc_sel t3
+                         where t3.b = t1.b and t3.k = x.k)
+           offset 0) sub;
+set local enable_hashjoin_bloom = off;
+select count(*) from bloom_resc_drv x,
+  lateral (select * from bloom_resc_o o join bloom_resc_big t1 on t1.j = o.j
+           where exists (select 1 from bloom_resc_sel t3
+                         where t3.b = t1.b and t3.k = x.k)
+           offset 0) sub;
+rollback;

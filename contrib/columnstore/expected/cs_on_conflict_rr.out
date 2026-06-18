@@ -1,0 +1,15 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_begin s1_snap s2_insert s1_upsert s1_commit
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_snap: SELECT count(*) FROM cs_conflict_rr;
+count
+-----
+    0
+(1 row)
+
+step s2_insert: INSERT INTO cs_conflict_rr VALUES (1, 'from_s2');
+step s1_upsert: INSERT INTO cs_conflict_rr VALUES (1, 'from_s1')
+                     ON CONFLICT (id) DO UPDATE SET val = 'updated_by_s1';
+ERROR:  could not serialize access due to concurrent update
+step s1_commit: COMMIT;

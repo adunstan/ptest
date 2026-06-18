@@ -1,0 +1,72 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_begin s1_count s2_insert s2_delete s2_vacuum s1_count s1_commit s2_count
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_count: SELECT count(*) AS total,
+                            count(*) FILTER (WHERE id <= 20) AS old_rows,
+                            count(*) FILTER (WHERE id > 100) AS new_rows
+                     FROM cs_snapstable;
+total|old_rows|new_rows
+-----+--------+--------
+  100|      20|       0
+(1 row)
+
+step s2_insert: INSERT INTO cs_snapstable SELECT i, 'n_' || i
+                     FROM generate_series(101, 120) i;
+step s2_delete: DELETE FROM cs_snapstable WHERE id <= 20;
+step s2_vacuum: VACUUM cs_snapstable;
+step s1_count: SELECT count(*) AS total,
+                            count(*) FILTER (WHERE id <= 20) AS old_rows,
+                            count(*) FILTER (WHERE id > 100) AS new_rows
+                     FROM cs_snapstable;
+total|old_rows|new_rows
+-----+--------+--------
+  100|      20|       0
+(1 row)
+
+step s1_commit: COMMIT;
+step s2_count: SELECT count(*) AS total,
+                            count(*) FILTER (WHERE id <= 20) AS old_rows,
+                            count(*) FILTER (WHERE id > 100) AS new_rows
+                     FROM cs_snapstable;
+total|old_rows|new_rows
+-----+--------+--------
+  100|       0|      20
+(1 row)
+
+
+starting permutation: s0_vacuum s1_begin s1_count s2_insert s2_delete s2_vacuum s1_count s1_commit s2_count
+step s0_vacuum: VACUUM cs_snapstable;
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_count: SELECT count(*) AS total,
+                            count(*) FILTER (WHERE id <= 20) AS old_rows,
+                            count(*) FILTER (WHERE id > 100) AS new_rows
+                     FROM cs_snapstable;
+total|old_rows|new_rows
+-----+--------+--------
+  100|      20|       0
+(1 row)
+
+step s2_insert: INSERT INTO cs_snapstable SELECT i, 'n_' || i
+                     FROM generate_series(101, 120) i;
+step s2_delete: DELETE FROM cs_snapstable WHERE id <= 20;
+step s2_vacuum: VACUUM cs_snapstable;
+step s1_count: SELECT count(*) AS total,
+                            count(*) FILTER (WHERE id <= 20) AS old_rows,
+                            count(*) FILTER (WHERE id > 100) AS new_rows
+                     FROM cs_snapstable;
+total|old_rows|new_rows
+-----+--------+--------
+  100|      20|       0
+(1 row)
+
+step s1_commit: COMMIT;
+step s2_count: SELECT count(*) AS total,
+                            count(*) FILTER (WHERE id <= 20) AS old_rows,
+                            count(*) FILTER (WHERE id > 100) AS new_rows
+                     FROM cs_snapstable;
+total|old_rows|new_rows
+-----+--------+--------
+  100|       0|      20
+(1 row)
+

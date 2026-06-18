@@ -987,6 +987,54 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		case RELKIND_PARTITIONED_TABLE:
 			(void) partitioned_table_reloptions(reloptions, true);
 			break;
+		case RELKIND_RELATION:
+		case RELKIND_MATVIEW:
+			{
+				amoptions_function amoptions = NULL;
+				Oid			amoid = InvalidOid;
+
+				/*
+				 * Resolve the table AM so its option parser can validate
+				 * AM-specific reloptions.  An AM that does not register a
+				 * parser falls back to default_reloptions for
+				 * RELOPT_KIND_HEAP.
+				 */
+				if (stmt->accessMethod != NULL)
+					amoid = get_table_am_oid(stmt->accessMethod, false);
+				else
+				{
+					/*
+					 * Mirror the real resolution below exactly: a partition
+					 * inherits the parent's AM, but a partitioned parent may
+					 * have none catalogued, in which case the default applies
+					 * -- validating against a different AM than the one the
+					 * relation is created with would make the two disagree
+					 * about which options are legal.
+					 */
+					amoid = InvalidOid;
+					if (stmt->partbound != NULL && inheritOids != NIL)
+						amoid = get_rel_relam(linitial_oid(inheritOids));
+					if (!OidIsValid(amoid))
+						amoid = get_table_am_oid(default_table_access_method,
+												 false);
+				}
+
+				if (OidIsValid(amoid))
+				{
+					HeapTuple	tuple;
+
+					tuple = SearchSysCache1(AMOID, ObjectIdGetDatum(amoid));
+					if (HeapTupleIsValid(tuple))
+					{
+						Form_pg_am	amform = (Form_pg_am) GETSTRUCT(tuple);
+
+						amoptions = GetTableAmRoutine(amform->amhandler)->amoptions;
+						ReleaseSysCache(tuple);
+					}
+				}
+				(void) table_reloptions(amoptions, relkind, reloptions, true);
+			}
+			break;
 		default:
 			(void) heap_reloptions(relkind, reloptions, true);
 	}
@@ -16765,6 +16813,47 @@ ATPrepSetAccessMethod(AlteredTableInfo *tab, Relation rel, const char *amname)
 	if (rel->rd_rel->relam == amoid)
 		return;
 
+	/*
+	 * Re-validate the stored reloptions against the new access method: an
+	 * AM-specific option the new AM does not recognise must be rejected
+	 * loudly here, not silently ignored at the next relcache load.  (Without
+	 * amoptions support every AM parses the heap option set, so this only
+	 * fires for AMs with their own option namespace.)
+	 */
+	if (OidIsValid(amoid) &&
+		(rel->rd_rel->relkind == RELKIND_RELATION ||
+		 rel->rd_rel->relkind == RELKIND_MATVIEW))
+	{
+		HeapTuple	tuple;
+		Datum		datum;
+		bool		isnull;
+
+		tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(RelationGetRelid(rel)));
+		if (!HeapTupleIsValid(tuple))
+			elog(ERROR, "cache lookup failed for relation %u",
+				 RelationGetRelid(rel));
+		datum = SysCacheGetAttr(RELOID, tuple, Anum_pg_class_reloptions,
+								&isnull);
+		if (!isnull)
+		{
+			HeapTuple	amtup;
+			Form_pg_am	amform;
+			const TableAmRoutine *amroutine;
+
+			amtup = SearchSysCache1(AMOID, ObjectIdGetDatum(amoid));
+			if (!HeapTupleIsValid(amtup))
+				elog(ERROR, "cache lookup failed for access method %u",
+					 amoid);
+			amform = (Form_pg_am) GETSTRUCT(amtup);
+			amroutine = GetTableAmRoutine(amform->amhandler);
+			ReleaseSysCache(amtup);
+
+			(void) table_reloptions(amroutine->amoptions,
+									rel->rd_rel->relkind, datum, true);
+		}
+		ReleaseSysCache(tuple);
+	}
+
 	/* Save info for Phase 3 to do the real work */
 	tab->rewrite |= AT_REWRITE_ACCESS_METHOD;
 	tab->newAccessMethod = amoid;
@@ -16952,7 +17041,8 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 	{
 		case RELKIND_RELATION:
 		case RELKIND_MATVIEW:
-			(void) heap_reloptions(rel->rd_rel->relkind, newOptions, true);
+			(void) table_reloptions(rel->rd_tableam ? rel->rd_tableam->amoptions : NULL,
+									rel->rd_rel->relkind, newOptions, true);
 			break;
 		case RELKIND_PARTITIONED_TABLE:
 			(void) partitioned_table_reloptions(newOptions, true);

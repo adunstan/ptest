@@ -1,0 +1,358 @@
+--
+-- Columnstore index scan and index-only scan tests
+--
+-- ===================================================================
+-- Index scan across multiple row groups
+-- ===================================================================
+CREATE TABLE cs_idx (id int, val text, num int) USING columnstore;
+INSERT INTO cs_idx SELECT i, 'rg1_' || i, i * 10 FROM generate_series(1, 500) i;
+VACUUM cs_idx;
+INSERT INTO cs_idx SELECT i, 'rg2_' || i, i * 10 FROM generate_series(501, 1000) i;
+VACUUM cs_idx;
+-- Delta rows
+INSERT INTO cs_idx SELECT i, 'delta_' || i, i * 10 FROM generate_series(1001, 1100) i;
+CREATE INDEX cs_idx_id ON cs_idx (id);
+ANALYZE cs_idx;
+SET enable_seqscan = off;
+-- Point lookups in each store
+SELECT id, val FROM cs_idx WHERE id = 1;
+ id |  val  
+----+-------
+  1 | rg1_1
+(1 row)
+
+SELECT id, val FROM cs_idx WHERE id = 500;
+ id  |   val   
+-----+---------
+ 500 | rg1_500
+(1 row)
+
+SELECT id, val FROM cs_idx WHERE id = 750;
+ id  |   val   
+-----+---------
+ 750 | rg2_750
+(1 row)
+
+SELECT id, val FROM cs_idx WHERE id = 1050;
+  id  |    val     
+------+------------
+ 1050 | delta_1050
+(1 row)
+
+-- Range scan spanning row groups
+SELECT count(*) FROM cs_idx WHERE id BETWEEN 450 AND 550;
+ count 
+-------
+   101
+(1 row)
+
+-- Range scan with deletions (re-enable seqscan for the DELETE)
+RESET enable_seqscan;
+DELETE FROM cs_idx WHERE id BETWEEN 490 AND 510;
+SET enable_seqscan = off;
+SELECT count(*) FROM cs_idx WHERE id BETWEEN 480 AND 520;
+ count 
+-------
+    20
+(1 row)
+
+RESET enable_seqscan;
+-- Partial index (predicate must be evaluated during build)
+CREATE INDEX cs_idx_partial ON cs_idx (id) WHERE id > 500;
+SET enable_seqscan = off;
+SELECT count(*) FROM cs_idx WHERE id > 500 AND id <= 600;
+ count 
+-------
+    90
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE cs_idx;
+-- ===================================================================
+-- Index-only scan on frozen row groups
+-- ===================================================================
+CREATE TABLE cs_ios (id int, val int) USING columnstore;
+INSERT INTO cs_ios SELECT i, i * 100 FROM generate_series(1, 1000) i;
+VACUUM cs_ios;
+CREATE INDEX cs_ios_id_val ON cs_ios (id, val);
+ANALYZE cs_ios;
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+-- Force index-only scan
+EXPLAIN (COSTS OFF) SELECT id, val FROM cs_ios WHERE id = 500;
+                QUERY PLAN                
+------------------------------------------
+ Bitmap Heap Scan on cs_ios
+   Recheck Cond: (id = 500)
+   ->  Bitmap Index Scan on cs_ios_id_val
+         Index Cond: (id = 500)
+(4 rows)
+
+SELECT id, val FROM cs_ios WHERE id = 500;
+ id  |  val  
+-----+-------
+ 500 | 50000
+(1 row)
+
+-- Range query via IOS
+SELECT count(*) FROM cs_ios WHERE id BETWEEN 1 AND 100;
+ count 
+-------
+   100
+(1 row)
+
+-- After deletion, IOS should still work
+RESET enable_seqscan;
+RESET enable_indexscan;
+DELETE FROM cs_ios WHERE id = 500;
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SELECT count(*) FROM cs_ios WHERE id BETWEEN 490 AND 510;
+ count 
+-------
+    20
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_indexscan;
+DROP TABLE cs_ios;
+-- ===================================================================
+-- Index scan with various predicate types
+-- ===================================================================
+CREATE TABLE cs_idx_pred (id int, category text, amount numeric(10,2)) USING columnstore;
+INSERT INTO cs_idx_pred SELECT i, 'cat_' || (i % 20), (i * 0.5)::numeric(10,2)
+    FROM generate_series(1, 2000) i;
+VACUUM cs_idx_pred;
+CREATE INDEX cs_idx_pred_cat ON cs_idx_pred (category);
+CREATE INDEX cs_idx_pred_amt ON cs_idx_pred (amount);
+ANALYZE cs_idx_pred;
+SET enable_seqscan = off;
+-- Equality on text
+SELECT count(*) FROM cs_idx_pred WHERE category = 'cat_0';
+ count 
+-------
+   100
+(1 row)
+
+-- Range on numeric
+SELECT count(*) FROM cs_idx_pred WHERE amount BETWEEN 100.00 AND 200.00;
+ count 
+-------
+   201
+(1 row)
+
+-- Verify actual values
+SELECT id, category, amount FROM cs_idx_pred WHERE category = 'cat_0' AND id <= 20 ORDER BY id;
+ id | category | amount 
+----+----------+--------
+ 20 | cat_0    |  10.00
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE cs_idx_pred;
+-- ===================================================================
+-- Index scan after UPDATE (mix of columnar + delta)
+-- ===================================================================
+CREATE TABLE cs_idx_upd (id int, val text) USING columnstore;
+INSERT INTO cs_idx_upd SELECT i, 'orig_' || i FROM generate_series(1, 500) i;
+VACUUM cs_idx_upd;
+CREATE INDEX cs_idx_upd_id ON cs_idx_upd (id);
+-- Update creates delta rows
+UPDATE cs_idx_upd SET val = 'updated' WHERE id BETWEEN 100 AND 110;
+SET enable_seqscan = off;
+-- Old columnar rows should be gone (via deletion bitmap)
+-- Updated rows should be found in delta store
+SELECT id, val FROM cs_idx_upd WHERE id = 100;
+ id  |   val   
+-----+---------
+ 100 | updated
+(1 row)
+
+SELECT id, val FROM cs_idx_upd WHERE id = 105;
+ id  |   val   
+-----+---------
+ 105 | updated
+(1 row)
+
+-- Non-updated row still in columnar
+SELECT id, val FROM cs_idx_upd WHERE id = 99;
+ id |   val   
+----+---------
+ 99 | orig_99
+(1 row)
+
+SELECT count(*) AS total FROM cs_idx_upd WHERE id BETWEEN 95 AND 115;
+ total 
+-------
+    21
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE cs_idx_upd;
+-- ===================================================================
+-- CREATE INDEX CONCURRENTLY
+-- ===================================================================
+CREATE TABLE cs_idx_cic (id int, val text, num int) USING columnstore;
+INSERT INTO cs_idx_cic SELECT i, 'rg1_' || i, i * 10 FROM generate_series(1, 500) i;
+VACUUM cs_idx_cic;
+INSERT INTO cs_idx_cic SELECT i, 'rg2_' || i, i * 10 FROM generate_series(501, 1000) i;
+VACUUM cs_idx_cic;
+-- Delta rows
+INSERT INTO cs_idx_cic SELECT i, 'delta_' || i, i * 10 FROM generate_series(1001, 1100) i;
+-- Build index concurrently (exercises cs_index_validate_scan)
+CREATE INDEX CONCURRENTLY cs_idx_cic_id ON cs_idx_cic (id);
+CREATE INDEX CONCURRENTLY cs_idx_cic_num ON cs_idx_cic (num);
+-- Verify indexes are valid
+SELECT indexrelid::regclass, indisvalid
+    FROM pg_index WHERE indrelid = 'cs_idx_cic'::regclass ORDER BY 1;
+   indexrelid   | indisvalid 
+----------------+------------
+ cs_idx_cic_id  | t
+ cs_idx_cic_num | t
+(2 rows)
+
+-- Verify index scan correctness
+SET enable_seqscan = off;
+SELECT id, val FROM cs_idx_cic WHERE id = 1;
+ id |  val  
+----+-------
+  1 | rg1_1
+(1 row)
+
+SELECT id, val FROM cs_idx_cic WHERE id = 750;
+ id  |   val   
+-----+---------
+ 750 | rg2_750
+(1 row)
+
+SELECT id, val FROM cs_idx_cic WHERE id = 1050;
+  id  |    val     
+------+------------
+ 1050 | delta_1050
+(1 row)
+
+SELECT count(*) FROM cs_idx_cic WHERE num BETWEEN 5000 AND 6000;
+ count 
+-------
+   101
+(1 row)
+
+RESET enable_seqscan;
+-- REINDEX CONCURRENTLY
+REINDEX INDEX CONCURRENTLY cs_idx_cic_id;
+SELECT indexrelid::regclass, indisvalid
+    FROM pg_index WHERE indrelid = 'cs_idx_cic'::regclass ORDER BY 1;
+   indexrelid   | indisvalid 
+----------------+------------
+ cs_idx_cic_num | t
+ cs_idx_cic_id  | t
+(2 rows)
+
+-- Partial index concurrently
+CREATE INDEX CONCURRENTLY cs_idx_cic_partial ON cs_idx_cic (id) WHERE id > 500;
+SET enable_seqscan = off;
+SELECT count(*) FROM cs_idx_cic WHERE id = 750;
+ count 
+-------
+     1
+(1 row)
+
+SELECT count(*) FROM cs_idx_cic WHERE id > 500 AND id <= 600;
+ count 
+-------
+   100
+(1 row)
+
+RESET enable_seqscan;
+DROP TABLE cs_idx_cic;
+-- ===================================================================
+-- Dense bitmap pages
+--
+-- A virtual block holds MaxHeapTuplesPerPage (291) rows; a bitmap
+-- scan matching more than 256 of them on one block used to overrun a
+-- 256-entry offset buffer (exact pages) or silently drop offsets
+-- 257..291 (lossy pages).  Match whole blocks and compare with the
+-- seqscan count, then force lossy pages with a tiny work_mem.
+-- ===================================================================
+CREATE TABLE cs_bm_dense (a int, b text) USING columnstore;
+INSERT INTO cs_bm_dense SELECT i, 'dense_' || i FROM generate_series(1, 2000) i;
+VACUUM cs_bm_dense;
+CREATE INDEX cs_bm_dense_a ON cs_bm_dense(a);
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SET enable_bitmapscan = on;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM cs_bm_dense WHERE a BETWEEN 1 AND 1800;
+                      QUERY PLAN                      
+------------------------------------------------------
+ Aggregate
+   ->  Bitmap Heap Scan on cs_bm_dense
+         Recheck Cond: ((a >= 1) AND (a <= 1800))
+         ->  Bitmap Index Scan on cs_bm_dense_a
+               Index Cond: ((a >= 1) AND (a <= 1800))
+(5 rows)
+
+SELECT count(*) FROM cs_bm_dense WHERE a BETWEEN 1 AND 1800;
+ count 
+-------
+  1800
+(1 row)
+
+SELECT sum(a) FROM cs_bm_dense WHERE a BETWEEN 1 AND 1800;
+   sum   
+---------
+ 1620900
+(1 row)
+
+-- lossy pages
+SET work_mem = '64kB';
+SELECT count(*) FROM cs_bm_dense WHERE a BETWEEN 1 AND 1800;
+ count 
+-------
+  1800
+(1 row)
+
+RESET work_mem;
+RESET enable_seqscan;
+RESET enable_indexscan;
+RESET enable_bitmapscan;
+DROP TABLE cs_bm_dense;
+-- index fetch of a whole-number (dscale 0) NI64 numeric column
+CREATE TABLE cs_idx_ni64 (id int, n numeric) USING columnstore;
+INSERT INTO cs_idx_ni64 SELECT i, i::numeric FROM generate_series(1, 500) i;
+VACUUM cs_idx_ni64;
+CREATE INDEX cs_idx_ni64_id ON cs_idx_ni64(id);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SELECT id, n FROM cs_idx_ni64 WHERE id = 250;
+ id  |  n  
+-----+-----
+ 250 | 250
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+DROP TABLE cs_idx_ni64;
+-- NI64 point reads across row groups: the conversion buffer must live
+-- with the column cache, not in the slot's per-tuple context, since the
+-- row-group switch frees it long after the slot context is reset
+CREATE TABLE cs_idx_ni64_multi (id int, n numeric(12,2)) USING columnstore;
+INSERT INTO cs_idx_ni64_multi
+    SELECT i, (i * 0.25)::numeric(12,2) FROM generate_series(1, 150000) i;
+VACUUM cs_idx_ni64_multi;
+CREATE INDEX cs_idx_ni64_multi_id ON cs_idx_ni64_multi(id);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+-- fetch rows from both row groups through one index scan
+SELECT id, n FROM cs_idx_ni64_multi
+    WHERE id IN (1, 99892, 99893, 150000) ORDER BY id;
+   id   |    n     
+--------+----------
+      1 |     0.25
+  99892 | 24973.00
+  99893 | 24973.25
+ 150000 | 37500.00
+(4 rows)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+DROP TABLE cs_idx_ni64_multi;

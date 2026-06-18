@@ -1,0 +1,171 @@
+--
+-- Columnstore zone map boundary conditions
+--
+
+-- ===================================================================
+-- NULLs-only row group
+-- ===================================================================
+CREATE TABLE cs_zm_allnull (id int, v int) USING columnstore;
+-- Row group 1: v is all NULL
+INSERT INTO cs_zm_allnull SELECT i, NULL FROM generate_series(1, 500) i;
+VACUUM cs_zm_allnull;
+-- Row group 2: v has values
+INSERT INTO cs_zm_allnull SELECT i + 500, i FROM generate_series(1, 500) i;
+VACUUM cs_zm_allnull;
+-- Zone map on all-NULL RG should have has_minmax=false
+-- This query should still find rows in RG2
+SELECT count(*) AS found FROM cs_zm_allnull WHERE v = 250;
+-- This should scan RG1 too (NULLs)
+SELECT count(*) AS null_count FROM cs_zm_allnull WHERE v IS NULL;
+-- This should return nothing (no match in RG2, RG1 is all NULL)
+SELECT count(*) AS none FROM cs_zm_allnull WHERE v = 999;
+DROP TABLE cs_zm_allnull;
+
+-- ===================================================================
+-- Zone map with single non-NULL value in otherwise-NULL column
+-- ===================================================================
+CREATE TABLE cs_zm_sparse (id int, v int) USING columnstore;
+INSERT INTO cs_zm_sparse SELECT i,
+    CASE WHEN i = 250 THEN 42 ELSE NULL END
+    FROM generate_series(1, 500) i;
+VACUUM cs_zm_sparse;
+-- Zone map min=max=42
+SELECT count(*) FROM cs_zm_sparse WHERE v = 42;
+SELECT count(*) FROM cs_zm_sparse WHERE v = 43;
+SELECT count(*) FROM cs_zm_sparse WHERE v IS NULL;
+DROP TABLE cs_zm_sparse;
+
+-- ===================================================================
+-- Text prefix boundaries: long text differing only after byte 32
+-- ===================================================================
+CREATE TABLE cs_zm_prefix (id int, v text COLLATE "C") USING columnstore;
+-- Row group 1: all start with same 32-byte prefix, differ at byte 33
+INSERT INTO cs_zm_prefix SELECT i,
+    repeat('A', 32) || chr(65 + (i % 26))  -- 'AAAA...A' + varying char
+    FROM generate_series(1, 500) i;
+VACUUM cs_zm_prefix;
+-- Row group 2: different first byte
+INSERT INTO cs_zm_prefix SELECT i + 500,
+    'Z' || repeat('A', 31) || chr(65 + (i % 26))
+    FROM generate_series(1, 500) i;
+VACUUM cs_zm_prefix;
+-- Query targeting RG1 prefix range
+SELECT count(*) AS rg1_only FROM cs_zm_prefix WHERE v < 'B';
+-- Query targeting RG2
+SELECT count(*) AS rg2_only FROM cs_zm_prefix WHERE v >= 'Z';
+-- Query matching both (prefix 'A' covers both due to truncation)
+SELECT count(*) AS total FROM cs_zm_prefix;
+DROP TABLE cs_zm_prefix;
+
+-- ===================================================================
+-- Zone map with boolean type
+-- ===================================================================
+CREATE TABLE cs_zm_bool (id int, v bool) USING columnstore;
+-- RG1: all true
+INSERT INTO cs_zm_bool SELECT i, true FROM generate_series(1, 500) i;
+VACUUM cs_zm_bool;
+-- RG2: all false
+INSERT INTO cs_zm_bool SELECT i + 500, false FROM generate_series(1, 500) i;
+VACUUM cs_zm_bool;
+SELECT count(*) AS true_count FROM cs_zm_bool WHERE v = true;
+SELECT count(*) AS false_count FROM cs_zm_bool WHERE v = false;
+DROP TABLE cs_zm_bool;
+
+-- ===================================================================
+-- Zone map with date boundaries
+-- ===================================================================
+CREATE TABLE cs_zm_date (id int, d date) USING columnstore;
+-- RG1: dates in 2020
+INSERT INTO cs_zm_date SELECT i, '2020-01-01'::date + i
+    FROM generate_series(0, 364) i;
+VACUUM cs_zm_date;
+-- RG2: dates in 2025
+INSERT INTO cs_zm_date SELECT i + 365, '2025-01-01'::date + i
+    FROM generate_series(0, 364) i;
+VACUUM cs_zm_date;
+-- Should only hit RG1
+SELECT count(*) AS y2020 FROM cs_zm_date WHERE d < '2021-01-01'::date;
+-- Should only hit RG2
+SELECT count(*) AS y2025 FROM cs_zm_date WHERE d >= '2025-01-01'::date;
+-- Should match nothing
+SELECT count(*) AS gap FROM cs_zm_date WHERE d >= '2022-01-01'::date AND d < '2024-01-01'::date;
+DROP TABLE cs_zm_date;
+
+-- ===================================================================
+-- Zone map with float edge cases (NaN, Inf)
+-- ===================================================================
+CREATE TABLE cs_zm_float (id int, v float8) USING columnstore;
+INSERT INTO cs_zm_float SELECT i, i::float8 FROM generate_series(1, 500) i;
+VACUUM cs_zm_float;
+-- Add special values in second row group
+INSERT INTO cs_zm_float VALUES (501, 'NaN'::float8);
+INSERT INTO cs_zm_float VALUES (502, 'Infinity'::float8);
+INSERT INTO cs_zm_float VALUES (503, '-Infinity'::float8);
+INSERT INTO cs_zm_float SELECT i, (i * 10)::float8 FROM generate_series(504, 1000) i;
+VACUUM cs_zm_float;
+SELECT count(*) AS total FROM cs_zm_float;
+-- Verify special values
+SELECT id, v FROM cs_zm_float WHERE id IN (501, 502, 503) ORDER BY id;
+DROP TABLE cs_zm_float;
+
+-- ===================================================================
+-- IS NOT NULL pruning: "no min/max recorded" is not "all NULL"
+--
+-- The zone map has no min/max for types without a btree opclass
+-- (json) and for text whose bounds exceed the inline size under a
+-- non-byte-ordered libc collation.  Those row groups must NOT be
+-- skipped for IS NOT NULL; only a group whose rows are all NULL may
+-- be.
+-- ===================================================================
+CREATE TABLE cs_zm_nulls (id int, t text COLLATE "default", j json) USING columnstore;
+-- 40-char values exceed the 32-byte inline zone map bound
+INSERT INTO cs_zm_nulls
+    SELECT i, repeat('x', 39) || (i % 7), ('{"v": ' || i || '}')::json
+    FROM generate_series(1, 500) i;
+VACUUM cs_zm_nulls;
+SELECT count(*) FROM cs_zm_nulls WHERE t IS NOT NULL;
+SELECT count(*) FROM cs_zm_nulls WHERE j IS NOT NULL;
+SELECT count(*) FROM cs_zm_nulls WHERE t IS NULL;
+DROP TABLE cs_zm_nulls;
+-- an all-NULL row group is still skippable
+CREATE TABLE cs_zm_allnull (id int, t text) USING columnstore;
+INSERT INTO cs_zm_allnull SELECT i, NULL FROM generate_series(1, 500) i;
+VACUUM cs_zm_allnull;
+SELECT count(*) FROM cs_zm_allnull WHERE t IS NOT NULL;
+SELECT count(*) FROM cs_zm_allnull WHERE t IS NULL;
+DROP TABLE cs_zm_allnull;
+
+-- ===================================================================
+-- By-reference zone map bounds: fixed-length types and non-byte-
+-- ordered varlenas
+--
+-- uuid/interval are by-ref but not varlena (a length header read off
+-- their raw bytes is garbage), and numeric's digit array must never
+-- be byte-truncated into "prefix" bounds.  Pruning must stay correct
+-- for all of them.
+-- ===================================================================
+CREATE TABLE cs_zm_byref (id int, u uuid, iv interval, n numeric) USING columnstore;
+INSERT INTO cs_zm_byref
+    SELECT i,
+           (lpad(to_hex(i), 8, '0')
+               || '-0000-4000-8000-000000000000')::uuid,
+           make_interval(days => i),
+           -- long negative numerics exceed the 32-byte inline bound
+           ('-9' || repeat('123456789', 6) || '.' || i)::numeric
+    FROM generate_series(1, 500) i;
+VACUUM cs_zm_byref;
+-- equality and range quals must find their rows
+SELECT id FROM cs_zm_byref
+    WHERE u = '000001f4-0000-4000-8000-000000000000';
+SELECT count(*) FROM cs_zm_byref WHERE iv >= interval '400 days';
+SELECT count(*) FROM cs_zm_byref WHERE n < 0;
+SELECT id FROM cs_zm_byref
+    WHERE n = ('-9' || repeat('123456789', 6) || '.' || 250)::numeric;
+DROP TABLE cs_zm_byref;
+
+-- keyed scans on a table with no row groups never consult zone maps
+CREATE TABLE cs_zm_deltaonly (id int, v text) USING columnstore;
+INSERT INTO cs_zm_deltaonly SELECT g, 'v' || g FROM generate_series(1, 100) g;
+SELECT count(*) FROM cs_zm_deltaonly WHERE id > 90;
+SELECT v FROM cs_zm_deltaonly WHERE id = 42;
+DROP TABLE cs_zm_deltaonly;

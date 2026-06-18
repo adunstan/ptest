@@ -389,6 +389,7 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	glob->lastPHId = 0;
 	glob->lastRowMarkId = 0;
 	glob->lastPlanNodeId = 0;
+	glob->lastBloomFilterId = 0;
 	glob->transientPlan = false;
 	glob->dependsOnRole = false;
 	glob->partition_directory = NULL;
@@ -4446,6 +4447,33 @@ create_ordinary_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
 		create_partitionwise_grouping_paths(root, input_rel, grouped_rel,
 											partially_grouped_rel, agg_costs,
 											gd, patype, extra);
+
+	/*
+	 * Let FDWs and extensions add partial-grouping paths before we Gather
+	 * them.  This is symmetric with UPPERREL_PARTIAL_DISTINCT (see
+	 * create_partial_distinct_paths) and with the post-Gather hook on
+	 * UPPERREL_GROUP_AGG below: any partial paths added here are picked up by
+	 * gather_grouping_paths and become candidates for the upstream Finalize
+	 * Aggregate that add_paths_to_grouping_rel builds.
+	 */
+	if (partially_grouped_rel)
+	{
+		/*
+		 * No GetForeignUpperPaths call here: create_partial_grouping_paths
+		 * already invoked it for UPPERREL_PARTIAL_GROUP_AGG, and FDWs are
+		 * entitled to assume one invocation per stage.
+		 */
+		if (create_upper_paths_hook)
+		{
+			/* let extensions see the partial grouping target too */
+			root->upper_targets[UPPERREL_PARTIAL_GROUP_AGG] =
+				partially_grouped_rel->reltarget;
+
+			(*create_upper_paths_hook) (root, UPPERREL_PARTIAL_GROUP_AGG,
+										input_rel, partially_grouped_rel,
+										extra);
+		}
+	}
 
 	/* If we are doing partial aggregation only, return. */
 	if (extra->patype == PARTITIONWISE_AGGREGATE_PARTIAL)

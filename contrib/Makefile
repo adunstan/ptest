@@ -91,6 +91,14 @@ else
 ALWAYS_SUBDIRS += hstore_plpython jsonb_plpython ltree_plpython
 endif
 
+# columnstore needs a native 128-bit integer type (PG_INT128_TYPE); build it
+# only where the platform has one (i.e. not on 32-bit or MSVC).
+ifeq ($(shell grep -q 'define PG_INT128_TYPE' $(top_builddir)/src/include/pg_config.h && echo yes),yes)
+SUBDIRS += columnstore
+else
+ALWAYS_SUBDIRS += columnstore
+endif
+
 # Missing:
 #		start-scripts	\ (does not have a makefile)
 

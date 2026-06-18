@@ -750,6 +750,49 @@ add_reloption_kind(void)
 }
 
 /*
+ * add_reloption_to_kind
+ *		Extend an already-registered reloption so it is also accepted for
+ *		the given kind.
+ *
+ * Useful for table access methods that want their own RELOPT_KIND_*
+ * parser to accept standard options (fillfactor, parallel_workers,
+ * autovacuum_*, etc.) that core registers only for RELOPT_KIND_HEAP.
+ * Without this, every AM that wants the standard option set would
+ * have to re-register each option under its own kind.
+ *
+ * 'name' must match an existing option registered for 'from_kind';
+ * 'kind' is OR'ed into that option's kinds mask.  The source kind
+ * disambiguates options that exist under the same name for several
+ * kinds (e.g. "fillfactor" for heap and for every index AM, with
+ * different defaults and limits).  Errors if no such option exists.
+ */
+void
+add_reloption_to_kind(const char *name, relopt_kind from_kind,
+					  relopt_kind kind)
+{
+	int			namelen = strlen(name);
+	int			i;
+
+	if (need_initialization)
+		initialize_reloptions();
+
+	for (i = 0; relOpts[i]; i++)
+	{
+		if ((relOpts[i]->kinds & from_kind) != 0 &&
+			relOpts[i]->namelen == namelen &&
+			strncmp(relOpts[i]->name, name, namelen) == 0)
+		{
+			relOpts[i]->kinds |= kind;
+			return;
+		}
+	}
+
+	ereport(ERROR,
+			(errcode(ERRCODE_UNDEFINED_OBJECT),
+			 errmsg("reloption \"%s\" does not exist", name)));
+}
+
+/*
  * add_reloption
  *		Add an already-created custom reloption to the list, and recompute the
  *		main parser table.
@@ -1516,8 +1559,11 @@ extractRelOptions(HeapTuple tuple, TupleDesc tupdesc,
 	switch (classForm->relkind)
 	{
 		case RELKIND_RELATION:
-		case RELKIND_TOASTVALUE:
 		case RELKIND_MATVIEW:
+			options = table_reloptions(amoptions, classForm->relkind,
+									   datum, false);
+			break;
+		case RELKIND_TOASTVALUE:
 			options = heap_reloptions(classForm->relkind, datum, false);
 			break;
 		case RELKIND_PARTITIONED_TABLE:
@@ -2185,6 +2231,31 @@ heap_reloptions(char relkind, Datum reloptions, bool validate)
 			/* other relkinds are not supported */
 			return NULL;
 	}
+}
+
+/*
+ * Parse options for a table relation, dispatching to the access method's
+ * own option parser when it supplies one.
+ *
+ *	amoptions	the table AM's option parser, or NULL to fall back to the
+ *				standard heap parser for this relkind.
+ *	relkind		the relation's kind.
+ *	reloptions	options as a text[] datum.
+ *	validate	error flag for unknown options or bad values.
+ *
+ * When amoptions is non-NULL the AM owns the option set: it may accept
+ * all standard heap options, only a subset, or define its own.  The
+ * returned bytea is laid out as the AM dictates (it is stored verbatim
+ * in Relation->rd_options).  When amoptions is NULL the result is the
+ * standard StdRdOptions layout.
+ */
+bytea *
+table_reloptions(amoptions_function amoptions, char relkind,
+				 Datum reloptions, bool validate)
+{
+	if (amoptions != NULL)
+		return amoptions(reloptions, validate);
+	return heap_reloptions(relkind, reloptions, validate);
 }
 
 

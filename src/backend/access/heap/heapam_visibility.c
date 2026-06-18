@@ -137,11 +137,22 @@ typedef enum SetHintBitsState
  *
  * The caller should pass xid as the XID of the transaction to check, or
  * InvalidTransactionId if no check is needed.
+ *
+ * The caller may pass NoHintBitsBuffer to indicate that the tuple's page
+ * must not be modified here, e.g. because the page's modifications are
+ * WAL-logged by some scheme other than heapam's (such as generic WAL), where
+ * an unlogged hint-bit write would invalidate the page's change tracking.
+ * Hint bits are only a cache of pg_xact state, so not setting them never
+ * affects the visibility verdict.
  */
 static inline void
 SetHintBitsExt(HeapTupleHeader tuple, Buffer buffer,
 			   uint16 infomask, TransactionId xid, SetHintBitsState *state)
 {
+	/* Caller asked us not to touch the page; see function comment. */
+	if (buffer == NoHintBitsBuffer)
+		return;
+
 	/*
 	 * In batched mode, if we previously did not get permission to set hint
 	 * bits, don't try again - in all likelihood IO is still going on.

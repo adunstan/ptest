@@ -476,6 +476,18 @@ extern bool heap_page_is_all_visible(Relation rel, Buffer buf,
 #endif
 
 /* in heap/heapam_visibility.c */
+
+/*
+ * Distinguished value a HeapTupleSatisfies* caller may pass instead of the
+ * buffer containing the tuple, to request the visibility verdict without any
+ * hint-bit maintenance.  Intended for callers whose pages must not be
+ * modified behind their back, e.g. because page modifications are WAL-logged
+ * by some scheme other than heapam's (such as generic WAL).  Deliberately
+ * not InvalidBuffer, and outside the range of valid buffer identifiers, so
+ * that an accidentally-invalid buffer still fails the usual assertions.
+ */
+#define NoHintBitsBuffer	((Buffer) PG_INT32_MIN)
+
 extern bool HeapTupleSatisfiesVisibility(HeapTuple htup, Snapshot snapshot,
 										 Buffer buffer);
 extern TM_Result HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid,

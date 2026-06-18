@@ -1,0 +1,163 @@
+--
+-- Columnstore sort_key: sorted compaction tests
+--
+
+-- ===================================================================
+-- Basic sort_key: verify rows come out sorted after VACUUM
+-- ===================================================================
+
+CREATE TABLE cs_sk_basic (id int, ts int, val text)
+    USING columnstore WITH (sort_key = 'ts');
+
+-- Insert in reverse order
+INSERT INTO cs_sk_basic SELECT i, 1000 - i, 'row-' || i FROM generate_series(1, 500) i;
+VACUUM cs_sk_basic;
+
+-- After compaction, rows should be sorted by ts within the row group.
+-- Verify with a scan that returns first/last ts values.
+SELECT min(ts), max(ts), count(*) FROM cs_sk_basic;
+
+-- Verify ordering: the first rows by ctid should have low ts values.
+-- (We can't rely on physical order in output without ORDER BY, but we
+-- can verify that sorting happened by checking zone map effectiveness.)
+SELECT ts, val FROM cs_sk_basic WHERE ts <= 5 ORDER BY ts;
+SELECT ts, val FROM cs_sk_basic WHERE ts >= 995 ORDER BY ts;
+
+DROP TABLE cs_sk_basic;
+
+-- ===================================================================
+-- Multi-column sort key
+-- ===================================================================
+
+CREATE TABLE cs_sk_multi (grp int, seq int, data int)
+    USING columnstore WITH (sort_key = 'grp, seq');
+
+INSERT INTO cs_sk_multi
+    SELECT (i % 5), (500 - i), i * 10
+    FROM generate_series(1, 500) i;
+VACUUM cs_sk_multi;
+
+-- Verify: rows should be ordered by (grp, seq) within the row group
+SELECT grp, seq, data FROM cs_sk_multi WHERE grp = 0 ORDER BY grp, seq LIMIT 5;
+SELECT grp, seq, data FROM cs_sk_multi WHERE grp = 4 ORDER BY grp, seq LIMIT 5;
+
+DROP TABLE cs_sk_multi;
+
+-- ===================================================================
+-- sort_key with NULLs (NULLs should sort last)
+-- ===================================================================
+
+CREATE TABLE cs_sk_nulls (id int, ts int)
+    USING columnstore WITH (sort_key = 'ts');
+
+INSERT INTO cs_sk_nulls VALUES (1, NULL), (2, 100), (3, NULL), (4, 50), (5, 200);
+INSERT INTO cs_sk_nulls SELECT i, i FROM generate_series(6, 500) i;
+VACUUM cs_sk_nulls;
+
+-- NULLs should be at the end of the sorted group
+SELECT id, ts FROM cs_sk_nulls WHERE ts IS NULL ORDER BY id;
+SELECT min(ts), max(ts) FROM cs_sk_nulls WHERE ts IS NOT NULL;
+
+DROP TABLE cs_sk_nulls;
+
+-- ===================================================================
+-- sort_key via ALTER TABLE SET
+-- ===================================================================
+
+CREATE TABLE cs_sk_alter (id int, v int) USING columnstore;
+INSERT INTO cs_sk_alter SELECT i, 1000 - i FROM generate_series(1, 500) i;
+VACUUM cs_sk_alter;
+
+-- No sort_key yet, data is in insertion order
+SELECT min(v), max(v), count(*) FROM cs_sk_alter;
+
+-- Set sort_key and re-compact (need to trigger recompaction)
+ALTER TABLE cs_sk_alter SET (sort_key = 'v');
+
+-- Insert more data and vacuum to get a new sorted row group
+INSERT INTO cs_sk_alter SELECT i + 500, 2000 - i FROM generate_series(1, 500) i;
+VACUUM cs_sk_alter;
+
+-- The new row group should be sorted by v
+SELECT min(v), max(v), count(*) FROM cs_sk_alter;
+
+DROP TABLE cs_sk_alter;
+
+-- ===================================================================
+-- Table without sort_key (no behavioral change)
+-- ===================================================================
+
+CREATE TABLE cs_sk_none (id int, v int) USING columnstore;
+INSERT INTO cs_sk_none SELECT i, i FROM generate_series(1, 500) i;
+VACUUM cs_sk_none;
+SELECT count(*), min(v), max(v) FROM cs_sk_none;
+DROP TABLE cs_sk_none;
+
+-- ===================================================================
+-- sort_key is columnstore-only: heap tables must reject it.
+--
+-- Guards against accidentally re-registering sort_key under
+-- RELOPT_KIND_HEAP, which would expose a columnstore-specific option
+-- to every heap relation in the database.
+-- ===================================================================
+CREATE TABLE sk_heap (id int, v int);
+ALTER TABLE sk_heap SET (sort_key = 'v');
+CREATE TABLE sk_heap_with (id int, v int) WITH (sort_key = 'v');
+DROP TABLE sk_heap;
+
+-- ===================================================================
+-- Pathkeys must not be claimed while the delta store is non-empty
+--
+-- The scan emits delta rows first, in insertion order, so the ordered
+-- path is only legal when every row lives in (non-overlapping) row
+-- groups.  After an INSERT the plan must regain its Sort node -- both
+-- for fresh plans and for cached generic plans, which rely on the
+-- relcache invalidation sent when the delta becomes non-empty.
+-- ===================================================================
+CREATE TABLE cs_sk_delta (a int, b text)
+    USING columnstore WITH (sort_key = 'a');
+INSERT INTO cs_sk_delta SELECT i, 'sk-' || i FROM generate_series(1, 10) i;
+VACUUM cs_sk_delta;
+INSERT INTO cs_sk_delta SELECT i, 'sk-' || i FROM generate_series(11, 20) i;
+VACUUM cs_sk_delta;
+-- delta empty: ordered path, no Sort
+EXPLAIN (COSTS OFF) SELECT a FROM cs_sk_delta ORDER BY a LIMIT 5;
+-- a cached generic plan must be invalidated by the insert below
+SET plan_cache_mode = force_generic_plan;
+PREPARE cs_sk_q AS SELECT a FROM cs_sk_delta ORDER BY a LIMIT 5;
+EXPLAIN (COSTS OFF) EXECUTE cs_sk_q;
+-- out-of-order row into the delta
+INSERT INTO cs_sk_delta VALUES (0, 'sk-0');
+-- fresh plan: Sort is back
+EXPLAIN (COSTS OFF) SELECT a FROM cs_sk_delta ORDER BY a LIMIT 5;
+SELECT a FROM cs_sk_delta ORDER BY a LIMIT 5;
+-- cached plan: replanned, Sort is back, output ordered
+EXPLAIN (COSTS OFF) EXECUTE cs_sk_q;
+EXECUTE cs_sk_q;
+DEALLOCATE cs_sk_q;
+RESET plan_cache_mode;
+DROP TABLE cs_sk_delta;
+
+-- ===================================================================
+-- ALTER TABLE ... SET ACCESS METHOD revalidates stored reloptions
+--
+-- A columnstore-only option must be rejected when switching to heap
+-- (with a usable error, not silently ignored at the next relcache
+-- load), and must work again after resetting the option.
+-- ===================================================================
+CREATE TABLE sk_switch (id int, v int)
+    USING columnstore WITH (sort_key = 'v');
+ALTER TABLE sk_switch SET ACCESS METHOD heap;
+ALTER TABLE sk_switch RESET (sort_key);
+ALTER TABLE sk_switch SET ACCESS METHOD heap;
+ALTER TABLE sk_switch SET ACCESS METHOD columnstore;
+SELECT amname FROM pg_am am JOIN pg_class c ON c.relam = am.oid
+    WHERE c.relname = 'sk_switch';
+DROP TABLE sk_switch;
+
+-- Materialized views must get the same reloption re-validation when
+-- changing access method as plain tables do.
+CREATE MATERIALIZED VIEW cs_sk_mv USING columnstore
+    WITH (sort_key = 'x') AS SELECT 1 AS x;
+ALTER MATERIALIZED VIEW cs_sk_mv SET ACCESS METHOD heap;  -- fails: heap has no sort_key
+DROP MATERIALIZED VIEW cs_sk_mv;

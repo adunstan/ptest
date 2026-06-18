@@ -1,0 +1,53 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_begin s1_update s1_commit s2_begin s2_lock_one s2_commit
+step s1_begin: BEGIN;
+step s1_update: UPDATE cs_lock_test SET val = 'updated' WHERE id = 1;
+step s1_commit: COMMIT;
+step s2_begin: BEGIN ISOLATION LEVEL READ COMMITTED;
+step s2_lock_one: SELECT * FROM cs_lock_test WHERE id = 1 FOR UPDATE;
+id|val    
+--+-------
+ 1|updated
+(1 row)
+
+step s2_commit: COMMIT;
+
+starting permutation: s1_begin s1_delete s1_commit s2_begin s2_lock_one s2_commit
+step s1_begin: BEGIN;
+step s1_delete: DELETE FROM cs_lock_test WHERE id = 1;
+step s1_commit: COMMIT;
+step s2_begin: BEGIN ISOLATION LEVEL READ COMMITTED;
+step s2_lock_one: SELECT * FROM cs_lock_test WHERE id = 1 FOR UPDATE;
+id|val
+--+---
+(0 rows)
+
+step s2_commit: COMMIT;
+
+starting permutation: s2_begin s1_begin s1_update s2_lock_one s1_commit s2_commit
+step s2_begin: BEGIN ISOLATION LEVEL READ COMMITTED;
+step s1_begin: BEGIN;
+step s1_update: UPDATE cs_lock_test SET val = 'updated' WHERE id = 1;
+step s2_lock_one: SELECT * FROM cs_lock_test WHERE id = 1 FOR UPDATE; <waiting ...>
+step s1_commit: COMMIT;
+step s2_lock_one: <... completed>
+id|val
+--+---
+(0 rows)
+
+step s2_commit: COMMIT;
+
+starting permutation: s1_begin s1_update s1_commit s2_begin s2_lock_all s2_commit
+step s1_begin: BEGIN;
+step s1_update: UPDATE cs_lock_test SET val = 'updated' WHERE id = 1;
+step s1_commit: COMMIT;
+step s2_begin: BEGIN ISOLATION LEVEL READ COMMITTED;
+step s2_lock_all: SELECT * FROM cs_lock_test ORDER BY id FOR UPDATE;
+id|val    
+--+-------
+ 1|updated
+ 2|keep   
+(2 rows)
+
+step s2_commit: COMMIT;

@@ -1,0 +1,550 @@
+--
+-- Columnstore aggregate correctness tests
+-- Tests SUM/AVG/COUNT/MIN/MAX against heap for various encodings
+--
+-- ===================================================================
+-- Basic aggregate correctness: NI64 columns with GROUP BY
+-- ===================================================================
+CREATE TABLE cs_agg (grp int, val numeric(10,2)) USING columnstore;
+CREATE TABLE heap_agg (grp int, val numeric(10,2));
+INSERT INTO cs_agg SELECT i % 10, (i * 1.23)::numeric(10,2)
+    FROM generate_series(1, 2000) i;
+INSERT INTO heap_agg SELECT i % 10, (i * 1.23)::numeric(10,2)
+    FROM generate_series(1, 2000) i;
+VACUUM cs_agg;
+-- Compare grouped aggregates
+SELECT count(*) FROM (
+    SELECT grp, sum(val) AS s, avg(val) AS a, min(val) AS mn, max(val) AS mx, count(*) AS c
+    FROM cs_agg GROUP BY grp
+    EXCEPT
+    SELECT grp, sum(val) AS s, avg(val) AS a, min(val) AS mn, max(val) AS mx, count(*) AS c
+    FROM heap_agg GROUP BY grp
+) diff;
+ count 
+-------
+     0
+(1 row)
+
+-- Ungrouped aggregates (compare to heap without exposing numeric dscale)
+SELECT (SELECT sum(val) FROM cs_agg) = (SELECT sum(val) FROM heap_agg) AS sum_match;
+ sum_match 
+-----------
+ t
+(1 row)
+
+SELECT (SELECT avg(val) FROM cs_agg) = (SELECT avg(val) FROM heap_agg) AS avg_match;
+ avg_match 
+-----------
+ t
+(1 row)
+
+DROP TABLE cs_agg;
+DROP TABLE heap_agg;
+-- ===================================================================
+-- Aggregates with NULLs
+-- ===================================================================
+CREATE TABLE cs_agg_null (grp int, val numeric(10,2)) USING columnstore;
+CREATE TABLE heap_agg_null (grp int, val numeric(10,2));
+INSERT INTO cs_agg_null SELECT i % 5,
+    CASE WHEN i % 3 = 0 THEN NULL ELSE (i * 0.5)::numeric(10,2) END
+    FROM generate_series(1, 1500) i;
+INSERT INTO heap_agg_null SELECT i % 5,
+    CASE WHEN i % 3 = 0 THEN NULL ELSE (i * 0.5)::numeric(10,2) END
+    FROM generate_series(1, 1500) i;
+VACUUM cs_agg_null;
+SELECT count(*) FROM (
+    SELECT grp, sum(val), count(val), count(*)
+    FROM cs_agg_null GROUP BY grp
+    EXCEPT
+    SELECT grp, sum(val), count(val), count(*)
+    FROM heap_agg_null GROUP BY grp
+) diff;
+ count 
+-------
+     0
+(1 row)
+
+DROP TABLE cs_agg_null;
+DROP TABLE heap_agg_null;
+-- ===================================================================
+-- Aggregates on integer types (FOR-encoded)
+-- ===================================================================
+CREATE TABLE cs_agg_int (grp int, v_i2 smallint, v_i4 int, v_i8 bigint) USING columnstore;
+CREATE TABLE heap_agg_int (grp int, v_i2 smallint, v_i4 int, v_i8 bigint);
+INSERT INTO cs_agg_int SELECT i % 7, (i % 100)::smallint, i, i::bigint * 100000
+    FROM generate_series(1, 2000) i;
+INSERT INTO heap_agg_int SELECT i % 7, (i % 100)::smallint, i, i::bigint * 100000
+    FROM generate_series(1, 2000) i;
+VACUUM cs_agg_int;
+SELECT count(*) FROM (
+    SELECT grp, sum(v_i2::int), sum(v_i4::bigint), sum(v_i8)
+    FROM cs_agg_int GROUP BY grp
+    EXCEPT
+    SELECT grp, sum(v_i2::int), sum(v_i4::bigint), sum(v_i8)
+    FROM heap_agg_int GROUP BY grp
+) diff;
+ count 
+-------
+     0
+(1 row)
+
+DROP TABLE cs_agg_int;
+DROP TABLE heap_agg_int;
+-- ===================================================================
+-- Aggregates with deletions in columnar data
+-- ===================================================================
+CREATE TABLE cs_agg_del (id int, val numeric(10,2)) USING columnstore;
+INSERT INTO cs_agg_del SELECT i, (i * 1.5)::numeric(10,2) FROM generate_series(1, 1000) i;
+VACUUM cs_agg_del;
+-- Delete even rows
+DELETE FROM cs_agg_del WHERE id % 2 = 0;
+-- Compare with heap that has only odd rows
+CREATE TABLE heap_agg_del AS
+    SELECT i AS id, (i * 1.5)::numeric(10,2) AS val
+    FROM generate_series(1, 1000) i WHERE i % 2 = 1;
+SELECT (SELECT sum(val) FROM cs_agg_del) = (SELECT sum(val) FROM heap_agg_del) AS sum_match;
+ sum_match 
+-----------
+ t
+(1 row)
+
+SELECT (SELECT count(*) FROM cs_agg_del) = (SELECT count(*) FROM heap_agg_del) AS count_match;
+ count_match 
+-------------
+ t
+(1 row)
+
+SELECT (SELECT avg(val) FROM cs_agg_del) = (SELECT avg(val) FROM heap_agg_del) AS avg_match;
+ avg_match 
+-----------
+ t
+(1 row)
+
+DROP TABLE cs_agg_del;
+DROP TABLE heap_agg_del;
+-- ===================================================================
+-- COUNT(*) with various combinations
+-- ===================================================================
+CREATE TABLE cs_count (id int, v int) USING columnstore;
+INSERT INTO cs_count SELECT i, i FROM generate_series(1, 1000) i;
+VACUUM cs_count;
+-- Pure columnar COUNT(*)
+SELECT count(*) AS pure_columnar FROM cs_count;
+ pure_columnar 
+---------------
+          1000
+(1 row)
+
+-- After deletions
+DELETE FROM cs_count WHERE id % 10 = 0;
+SELECT count(*) AS after_delete FROM cs_count;
+ after_delete 
+--------------
+          900
+(1 row)
+
+-- Mixed delta + columnar
+INSERT INTO cs_count SELECT i, i FROM generate_series(2000, 2050) i;
+SELECT count(*) AS mixed FROM cs_count;
+ mixed 
+-------
+   951
+(1 row)
+
+-- COUNT with filter
+SELECT count(*) AS filtered FROM cs_count WHERE v > 500;
+ filtered 
+----------
+      501
+(1 row)
+
+DROP TABLE cs_count;
+-- ===================================================================
+-- Aggregate pushdown after UPDATE on columnar rows
+--
+-- An UPDATE on a columnar row creates one tombstone (the deleted
+-- columnar row) plus one new delta tuple.  The COUNT(*) fast path
+-- exercises both the deletion bitmap iteration and the delta-store
+-- scan in the same query.  This is the case that caught a regression
+-- where the agg pushdown returned 0 instead of the expected count.
+-- ===================================================================
+CREATE TABLE cs_agg_upd (id int, val int) USING columnstore;
+CREATE TABLE heap_agg_upd (id int, val int);
+INSERT INTO cs_agg_upd SELECT i, i FROM generate_series(1, 1000) i;
+INSERT INTO heap_agg_upd SELECT i, i FROM generate_series(1, 1000) i;
+VACUUM cs_agg_upd;
+UPDATE cs_agg_upd   SET val = val + 100000 WHERE id BETWEEN 100 AND 110;
+UPDATE heap_agg_upd SET val = val + 100000 WHERE id BETWEEN 100 AND 110;
+SELECT (SELECT count(*) FROM cs_agg_upd) = (SELECT count(*) FROM heap_agg_upd) AS count_match;
+ count_match 
+-------------
+ t
+(1 row)
+
+SELECT (SELECT sum(val) FROM cs_agg_upd) = (SELECT sum(val) FROM heap_agg_upd) AS sum_match;
+ sum_match 
+-----------
+ t
+(1 row)
+
+SELECT (SELECT min(val) FROM cs_agg_upd) = (SELECT min(val) FROM heap_agg_upd) AS min_match;
+ min_match 
+-----------
+ t
+(1 row)
+
+SELECT (SELECT max(val) FROM cs_agg_upd) = (SELECT max(val) FROM heap_agg_upd) AS max_match;
+ max_match 
+-----------
+ t
+(1 row)
+
+SELECT (SELECT avg(val) FROM cs_agg_upd) = (SELECT avg(val) FROM heap_agg_upd) AS avg_match;
+ avg_match 
+-----------
+ t
+(1 row)
+
+DROP TABLE cs_agg_upd;
+DROP TABLE heap_agg_upd;
+-- ===================================================================
+-- Aggregate pushdown edge safety
+-- ===================================================================
+CREATE TABLE cs_agg_edge (k int, g int, n numeric, t text) USING columnstore;
+INSERT INTO cs_agg_edge
+    SELECT i % 5, i % 3, (i % 100) / 10.0, 'x' || i FROM generate_series(1, 1000) i;
+VACUUM cs_agg_edge;
+ANALYZE cs_agg_edge;
+-- whole-row references must materialize every column
+SELECT (e).k, (e).t FROM (SELECT e FROM cs_agg_edge e WHERE (e).k = 2 LIMIT 1) s;
+ k | t  
+---+----
+ 2 | x2
+(1 row)
+
+SELECT count(*) FROM cs_agg_edge e WHERE length(e::text) > 10;
+ count 
+-------
+  1000
+(1 row)
+
+-- correlated COUNT(DISTINCT) rescanned per outer row
+CREATE TABLE cs_agg_outer (k int);
+INSERT INTO cs_agg_outer VALUES (0), (1), (2);
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_memoize = off;
+SELECT o.k, (SELECT count(DISTINCT g) FROM cs_agg_edge e WHERE e.k = o.k) AS dg
+    FROM cs_agg_outer o ORDER BY o.k;
+ k | dg 
+---+----
+ 0 |  3
+ 1 |  3
+ 2 |  3
+(3 rows)
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_memoize;
+-- quals containing sublinks fall through to the standard plan
+SELECT count(*) FROM cs_agg_edge
+    WHERE g = 1 OR k IN (SELECT k FROM cs_agg_outer);
+ count 
+-------
+   733
+(1 row)
+
+-- a user-defined zero-argument aggregate is not COUNT(*): this one
+-- counts from 42, so the answer must be 1042, not the 1000 a
+-- misclassification as COUNT(*) would give
+CREATE AGGREGATE cs_count_from_42 (*) (
+    SFUNC = int4inc, STYPE = int4, INITCOND = '42');
+SELECT cs_count_from_42(*) FROM cs_agg_edge;
+ cs_count_from_42 
+------------------
+             1042
+(1 row)
+
+DROP AGGREGATE cs_count_from_42 (*);
+-- ORDER BY ctid LIMIT must not go through late materialization
+EXPLAIN (COSTS OFF) SELECT k FROM cs_agg_edge ORDER BY ctid LIMIT 3;
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: ctid
+         ->  Custom Scan (ColumnstoreScan) on cs_agg_edge
+               Columnstore Projected Columns: k
+(5 rows)
+
+DROP TABLE cs_agg_outer;
+DROP TABLE cs_agg_edge;
+-- Numeric columns whose dscale changes between row groups.  The first
+-- 100k rows are huge whole numbers (NI64 dscale 0), the next 100k are
+-- tiny 20-decimal fractions, so the two batches straddle a row-group
+-- boundary: one row group is pure dscale 0, the mixed one cannot use
+-- NI64 at all, and the tail is pure dscale 20.  This exercises
+-- (a) clearing NI64 state when the next row group is not NI64-encoded,
+-- and (b) the int128 SUM/AVG fast path rescaling its accumulator across
+-- dscales, including the overflow flush into the numeric accumulator
+-- (9e18 * 100k * 10^20 vastly exceeds the int128 guard).
+CREATE TABLE cs_agg_mixscale (v numeric) USING columnstore;
+INSERT INTO cs_agg_mixscale
+    SELECT 9000000000000000000::numeric FROM generate_series(1, 100000);
+INSERT INTO cs_agg_mixscale
+    SELECT 0.00000000000000000001 FROM generate_series(1, 100000);
+VACUUM cs_agg_mixscale;
+SELECT sum(v), avg(v), count(v) FROM cs_agg_mixscale;
+                      sum                      |                   avg                    | count  
+-----------------------------------------------+------------------------------------------+--------
+ 900000000000000000000000.00000000000000100000 | 4500000000000000000.00000000000000000001 | 200000
+(1 row)
+
+-- must match the non-pushdown answer exactly
+SELECT sum(v), avg(v), count(v) FROM (SELECT v FROM cs_agg_mixscale OFFSET 0) s;
+                      sum                      |                   avg                    | count  
+-----------------------------------------------+------------------------------------------+--------
+ 900000000000000000000000.00000000000000100000 | 4500000000000000000.00000000000000000001 | 200000
+(1 row)
+
+-- row-level quals read per-value through the column cache; a stale NI64
+-- flag would misdecode the non-NI64 row groups here
+SELECT count(*) FROM cs_agg_mixscale WHERE v > 1;
+ count  
+--------
+ 100000
+(1 row)
+
+SELECT sum(v) FROM cs_agg_mixscale WHERE v < 1;
+          sum           
+------------------------
+ 0.00000000000000100000
+(1 row)
+
+-- reversed insert order: the accumulator starts at dscale 20 and then
+-- meets dscale-0 values too large to upscale, forcing the per-value
+-- numeric fallback path
+CREATE TABLE cs_agg_mixscale_rev (v numeric) USING columnstore;
+INSERT INTO cs_agg_mixscale_rev
+    SELECT 0.00000000000000000001 FROM generate_series(1, 100000);
+INSERT INTO cs_agg_mixscale_rev
+    SELECT 9000000000000000000::numeric FROM generate_series(1, 100000);
+VACUUM cs_agg_mixscale_rev;
+SELECT sum(v), avg(v) FROM cs_agg_mixscale_rev;
+                      sum                      |                   avg                    
+-----------------------------------------------+------------------------------------------
+ 900000000000000000000000.00000000000000100000 | 4500000000000000000.00000000000000000001
+(1 row)
+
+SELECT sum(v), avg(v) FROM (SELECT v FROM cs_agg_mixscale_rev OFFSET 0) s;
+                      sum                      |                   avg                    
+-----------------------------------------------+------------------------------------------
+ 900000000000000000000000.00000000000000100000 | 4500000000000000000.00000000000000000001
+(1 row)
+
+DROP TABLE cs_agg_mixscale;
+DROP TABLE cs_agg_mixscale_rev;
+-- High-scale numeric.  Finalizing SUM/AVG over an NI64-encoded column builds
+-- the result from the int128 accumulator using the column's stored dscale.
+-- Here dscale is 50 -- far past any small fixed buffer -- with a tiny
+-- magnitude, so the conversion must size its workspace to the scale rather
+-- than overrunning it.  The pushed-down answer must match the non-pushdown one.
+CREATE TABLE cs_agg_hiscale (v numeric) USING columnstore;
+INSERT INTO cs_agg_hiscale
+    SELECT '1e-50'::numeric FROM generate_series(1, 1000);
+VACUUM cs_agg_hiscale;
+SELECT sum(v), avg(v), count(v) FROM cs_agg_hiscale;
+                         sum                          |                                  avg                                   | count 
+------------------------------------------------------+------------------------------------------------------------------------+-------
+ 0.00000000000000000000000000000000000000000000001000 | 0.00000000000000000000000000000000000000000000000001000000000000000000 |  1000
+(1 row)
+
+SELECT sum(v), avg(v), count(v) FROM (SELECT v FROM cs_agg_hiscale OFFSET 0) s;
+                         sum                          |                                  avg                                   | count 
+------------------------------------------------------+------------------------------------------------------------------------+-------
+ 0.00000000000000000000000000000000000000000000001000 | 0.00000000000000000000000000000000000000000000000001000000000000000000 |  1000
+(1 row)
+
+DROP TABLE cs_agg_hiscale;
+-- Inheritance parents: rows live in append children, so aggregate,
+-- ORDER BY and late-materialization pushdown must all refuse the parent
+-- (the plan must contain an Append, not a single pushdown node)
+CREATE TABLE cs_agg_parent (v int) USING columnstore;
+CREATE TABLE cs_agg_child (extra int) INHERITS (cs_agg_parent)
+    USING columnstore;
+INSERT INTO cs_agg_parent VALUES (1), (2);
+INSERT INTO cs_agg_child VALUES (3, 30);
+SELECT count(*), sum(v) FROM cs_agg_parent;
+ count | sum 
+-------+-----
+     3 |   6
+(1 row)
+
+SELECT v FROM cs_agg_parent ORDER BY v DESC LIMIT 1;
+ v 
+---
+ 3
+(1 row)
+
+EXPLAIN (COSTS OFF) SELECT count(*), sum(v) FROM cs_agg_parent;
+                                 QUERY PLAN                                 
+----------------------------------------------------------------------------
+ Aggregate
+   ->  Append
+         ->  Custom Scan (ColumnstoreScan) on cs_agg_parent cs_agg_parent_1
+               Columnstore Projected Columns: v
+         ->  Custom Scan (ColumnstoreScan) on cs_agg_child cs_agg_parent_2
+               Columnstore Projected Columns: v
+(6 rows)
+
+SELECT count(*), sum(v) FROM ONLY cs_agg_parent;
+ count | sum 
+-------+-----
+     2 |   3
+(1 row)
+
+DROP TABLE cs_agg_child;
+DROP TABLE cs_agg_parent;
+-- Partitioned tables: aggregate over the parent covers every partition
+CREATE TABLE cs_agg_part (k int, v int) PARTITION BY RANGE (k)
+    USING columnstore;
+CREATE TABLE cs_agg_part1 PARTITION OF cs_agg_part
+    FOR VALUES FROM (0) TO (100);
+CREATE TABLE cs_agg_part2 PARTITION OF cs_agg_part
+    FOR VALUES FROM (100) TO (200);
+INSERT INTO cs_agg_part SELECT g % 200, g FROM generate_series(1, 400) g;
+VACUUM cs_agg_part1;
+VACUUM cs_agg_part2;
+SELECT count(*), sum(v) FROM cs_agg_part;
+ count |  sum  
+-------+-------
+   400 | 80200
+(1 row)
+
+SELECT count(*), sum(v) FROM (SELECT v FROM cs_agg_part OFFSET 0) s;
+ count |  sum  
+-------+-------
+   400 | 80200
+(1 row)
+
+-- FROM ONLY on the partitioned parent clears rte->inh: the parent has
+-- the columnstore relam but no storage, so every pushdown (and the
+-- scan provider) must refuse it rather than scan a storage-less rel
+SELECT count(*), sum(v) FROM ONLY cs_agg_part;
+ count | sum 
+-------+-----
+     0 |    
+(1 row)
+
+SELECT v FROM ONLY cs_agg_part ORDER BY v LIMIT 1;
+ v 
+---
+(0 rows)
+
+DROP TABLE cs_agg_part;
+-- Aggregate edges: empty input, all-NULL columns, NULL GROUP BY keys
+CREATE TABLE cs_agg_null (k int, v int, n numeric) USING columnstore;
+SELECT count(*), sum(v), avg(n), min(v), max(n) FROM cs_agg_null;
+ count | sum | avg | min | max 
+-------+-----+-----+-----+-----
+     0 |     |     |     |    
+(1 row)
+
+INSERT INTO cs_agg_null
+    SELECT NULLIF(g % 3, 2), NULLIF(g, 5),
+           CASE WHEN g % 4 = 0 THEN NULL ELSE g * 0.5 END
+    FROM generate_series(1, 1000) g;
+VACUUM cs_agg_null;
+SELECT count(*), count(v), count(n), sum(v), sum(n) FROM cs_agg_null;
+ count | count | count |  sum   |   sum    
+-------+-------+-------+--------+----------
+  1000 |   999 |   750 | 500495 | 187500.0
+(1 row)
+
+SELECT count(*), count(v), count(n), sum(v), sum(n)
+    FROM (SELECT v, n FROM cs_agg_null OFFSET 0) s;
+ count | count | count |  sum   |   sum    
+-------+-------+-------+--------+----------
+  1000 |   999 |   750 | 500495 | 187500.0
+(1 row)
+
+SELECT k, count(*), sum(v) FROM cs_agg_null
+    GROUP BY k ORDER BY k NULLS FIRST;
+ k | count |  sum   
+---+-------+--------
+   |   333 | 166495
+ 0 |   333 | 166833
+ 1 |   334 | 167167
+(3 rows)
+
+CREATE TABLE cs_agg_allnull (v numeric) USING columnstore;
+INSERT INTO cs_agg_allnull SELECT NULL FROM generate_series(1, 500);
+VACUUM cs_agg_allnull;
+SELECT count(*), count(v), sum(v), avg(v) FROM cs_agg_allnull;
+ count | count | sum | avg 
+-------+-------+-----+-----
+   500 |     0 |     |    
+(1 row)
+
+DROP TABLE cs_agg_null, cs_agg_allnull;
+-- Parallel-aware partial ColumnstoreAggregate.  A grouped aggregate over a
+-- table with more than one row group, with the parallel cost knobs forced
+-- on, plans a "Parallel Custom Scan (ColumnstoreAggregate)" under a
+-- Gather that the Finalize aggregate combines.  Each worker (or the leader,
+-- if no worker launches) runs the grouped emit path, which deforms the
+-- per-group hash tuples through grp_slot's descriptor -- the descriptor
+-- must be TupleDescFinalize()d or that deform asserts/misreads.  The serial
+-- grouped query uses a plain HashAggregate, so this path is reachable only
+-- under parallelism.
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET max_parallel_workers_per_gather = 2;
+CREATE TABLE cs_agg_par (g int, i4 int, i8 bigint, n numeric) USING columnstore;
+INSERT INTO cs_agg_par
+    SELECT i % 5, i, i::bigint * 1000, (i % 50) * 0.5
+    FROM generate_series(1, 120000) i;
+VACUUM cs_agg_par;
+EXPLAIN (COSTS OFF)
+    SELECT g, count(*), sum(i4), sum(i8), avg(i4), min(i4), max(i4)
+        FROM cs_agg_par GROUP BY g;
+                                                                  QUERY PLAN                                                                  
+----------------------------------------------------------------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: g
+   ->  Gather
+         Workers Planned: 2
+         ->  Parallel Custom Scan (ColumnstoreAggregate) on cs_agg_par
+               Columnstore Aggregates: group_by(att=1), count(att=0), sum_int(att=2), sum_int8(att=3), avg_int(att=2), min(att=2), max(att=2)
+(6 rows)
+
+-- Pushed-down integer aggregates combined across workers; values are
+-- deterministic regardless of how many workers actually launch.
+SELECT g, count(*), sum(i4), sum(i8), avg(i4), min(i4), max(i4)
+    FROM cs_agg_par GROUP BY g ORDER BY g;
+ g | count |    sum     |      sum      |        avg         | min |  max   
+---+-------+------------+---------------+--------------------+-----+--------
+ 0 | 24000 | 1440060000 | 1440060000000 | 60002.500000000000 |   5 | 120000
+ 1 | 24000 | 1439964000 | 1439964000000 | 59998.500000000000 |   1 | 119996
+ 2 | 24000 | 1439988000 | 1439988000000 | 59999.500000000000 |   2 | 119997
+ 3 | 24000 | 1440012000 | 1440012000000 | 60000.500000000000 |   3 | 119998
+ 4 | 24000 | 1440036000 | 1440036000000 | 60001.500000000000 |   4 | 119999
+(5 rows)
+
+-- SUM/AVG(numeric) are deliberately not partial-pushed; the query still
+-- runs correctly under the same parallel knobs (via the stock aggregate).
+SELECT g, sum(n), avg(n) FROM cs_agg_par GROUP BY g ORDER BY g;
+ g |   sum    |         avg         
+---+----------+---------------------
+ 0 | 270000.0 | 11.2500000000000000
+ 1 | 282000.0 | 11.7500000000000000
+ 2 | 294000.0 | 12.2500000000000000
+ 3 | 306000.0 | 12.7500000000000000
+ 4 | 318000.0 | 13.2500000000000000
+(5 rows)
+
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET max_parallel_workers_per_gather;
+DROP TABLE cs_agg_par;
