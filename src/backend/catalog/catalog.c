@@ -573,6 +573,19 @@ GetNewRelFileNumber(Oid reltablespace, Relation pg_class, char relpersistence)
 		case RELPERSISTENCE_TEMP:
 			procNumber = ProcNumberForTempRelations();
 			break;
+
+			/*
+			 * A global temporary table never has a file at the shared path;
+			 * its per-session files live in each backend's temp-relation
+			 * namespace, using this relfilenumber.  Probe our own temp
+			 * namespace, the same one the file will be created in for this
+			 * session; other backends' namespaces cannot be checked here,
+			 * which is the same (wraparound-only) exposure regular temp
+			 * tables have.
+			 */
+		case RELPERSISTENCE_GLOBAL_TEMP:
+			procNumber = ProcNumberForTempRelations();
+			break;
 		case RELPERSISTENCE_UNLOGGED:
 		case RELPERSISTENCE_PERMANENT:
 			procNumber = INVALID_PROC_NUMBER;

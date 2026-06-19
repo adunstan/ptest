@@ -356,6 +356,7 @@ typedef struct StdRdOptions
 	 * to freeze. 0 if disabled, -1 if unspecified.
 	 */
 	double		vacuum_max_eager_freeze_failure_rate;
+	bool		on_commit_delete;	/* GTT: truncate data on commit */
 } StdRdOptions;
 
 #define HEAP_MIN_FILLFACTOR			10
@@ -642,11 +643,19 @@ RelationCloseSmgr(Relation relation)
 	   relation->rd_firstRelfilelocatorSubid == InvalidSubTransactionId)))
 
 /*
+ * RelationIsGlobalTemp
+ *		True if relation is a global temporary table.
+ */
+#define RelationIsGlobalTemp(relation) \
+	((relation)->rd_rel->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+
+/*
  * RelationUsesLocalBuffers
  *		True if relation's pages are stored in local buffers.
  */
 #define RelationUsesLocalBuffers(relation) \
-	((relation)->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+	((relation)->rd_rel->relpersistence == RELPERSISTENCE_TEMP || \
+	 (relation)->rd_rel->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
 
 /*
  * RELATION_IS_LOCAL

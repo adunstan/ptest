@@ -3050,6 +3050,10 @@ makeTableDataInfo(DumpOptions *dopt, TableInfo *tbinfo)
 	if (tbinfo->relkind == RELKIND_PARTITIONED_TABLE)
 		return;
 
+	/* Never dump data for global temporary tables (data is per-session) */
+	if (tbinfo->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+		return;
+
 	/* Don't dump data in unlogged tables, if so requested */
 	if (tbinfo->relpersistence == RELPERSISTENCE_UNLOGGED &&
 		dopt->no_unlogged_table_data)
@@ -7315,6 +7319,7 @@ getTables(Archive *fout, int *numTables)
 	int			i_toastminmxid;
 	int			i_reloptions;
 	int			i_checkoption;
+	int			i_gtt_on_commit_delete;
 	int			i_toastreloptions;
 	int			i_reloftype;
 	int			i_foreignserver;
@@ -7409,12 +7414,24 @@ getTables(Archive *fout, int *numTables)
 
 	if (fout->remoteVersion >= 90300)
 		appendPQExpBufferStr(query,
-							 "array_remove(array_remove(c.reloptions,'check_option=local'),'check_option=cascaded') AS reloptions, "
+
+		/*
+		 * Filter out reloptions that are internal to the server and shouldn't
+		 * be emitted as user-visible WITH(...) items.  Keyed by prefix so
+		 * that a future change to how these options are serialised (different
+		 * value spellings, added keys) doesn't silently break pg_dump.
+		 */
+							 "ARRAY(SELECT r FROM unnest(c.reloptions) AS r "
+							 "WHERE r NOT LIKE 'check_option=%' "
+							 "  AND r NOT LIKE 'on_commit_delete=%') "
+							 "AS reloptions, "
 							 "CASE WHEN 'check_option=local' = ANY (c.reloptions) THEN 'LOCAL'::text "
-							 "WHEN 'check_option=cascaded' = ANY (c.reloptions) THEN 'CASCADED'::text ELSE NULL END AS checkoption, ");
+							 "WHEN 'check_option=cascaded' = ANY (c.reloptions) THEN 'CASCADED'::text ELSE NULL END AS checkoption, "
+							 "('on_commit_delete=true' = ANY (c.reloptions)) AS gtt_on_commit_delete, ");
 	else
 		appendPQExpBufferStr(query,
-							 "c.reloptions, NULL AS checkoption, ");
+							 "c.reloptions, NULL AS checkoption, "
+							 "false AS gtt_on_commit_delete, ");
 
 	if (fout->remoteVersion >= 90600)
 		appendPQExpBufferStr(query,
@@ -7540,6 +7557,7 @@ getTables(Archive *fout, int *numTables)
 	i_toastminmxid = PQfnumber(res, "tminmxid");
 	i_reloptions = PQfnumber(res, "reloptions");
 	i_checkoption = PQfnumber(res, "checkoption");
+	i_gtt_on_commit_delete = PQfnumber(res, "gtt_on_commit_delete");
 	i_toastreloptions = PQfnumber(res, "toast_reloptions");
 	i_reloftype = PQfnumber(res, "reloftype");
 	i_foreignserver = PQfnumber(res, "foreignserver");
@@ -7621,6 +7639,8 @@ getTables(Archive *fout, int *numTables)
 			tblinfo[i].checkoption = NULL;
 		else
 			tblinfo[i].checkoption = pg_strdup(PQgetvalue(res, i, i_checkoption));
+		tblinfo[i].gtt_on_commit_delete =
+			(strcmp(PQgetvalue(res, i, i_gtt_on_commit_delete), "t") == 0);
 		tblinfo[i].toast_reloptions = pg_strdup(PQgetvalue(res, i, i_toastreloptions));
 		tblinfo[i].reloftype = atooid(PQgetvalue(res, i, i_reloftype));
 		tblinfo[i].foreign_server = atooid(PQgetvalue(res, i, i_foreignserver));
@@ -7668,8 +7688,14 @@ getTables(Archive *fout, int *numTables)
 			tblinfo[i].dobj.components |= DUMP_COMPONENT_ACL;
 		tblinfo[i].hascolumnACLs = false;	/* may get set later */
 
-		/* Add statistics */
-		if (tblinfo[i].interesting)
+		/*
+		 * Add statistics.  Global temporary tables are skipped: their
+		 * statistics are per-session (the shared pg_class/pg_statistic rows
+		 * are never populated), and pg_restore_relation_stats() refuses to
+		 * write shared statistics for them on restore.
+		 */
+		if (tblinfo[i].interesting &&
+			tblinfo[i].relpersistence != RELPERSISTENCE_GLOBAL_TEMP)
 		{
 			RelStatsInfo *stats;
 
@@ -8240,10 +8266,14 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 					pg_fatal("could not parse %s array", "indattnames");
 			}
 
-			relstats = getRelationStatistics(fout, &indxinfo[j].dobj, relpages,
-											 PQgetvalue(res, j, i_reltuples),
-											 relallvisible, relallfrozen, indexkind,
-											 indAttNames, nindAttNames);
+			/* as in getTables, no statistics for global temp tables */
+			if (tbinfo->relpersistence != RELPERSISTENCE_GLOBAL_TEMP)
+				relstats = getRelationStatistics(fout, &indxinfo[j].dobj, relpages,
+												 PQgetvalue(res, j, i_reltuples),
+												 relallvisible, relallfrozen, indexkind,
+												 indAttNames, nindAttNames);
+			else
+				relstats = NULL;
 
 			contype = *(PQgetvalue(res, j, i_contype));
 			if (contype == 'p' || contype == 'u' || contype == 'x')
@@ -17453,6 +17483,8 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 		 * ignore it when dumping if it was set in this case.
 		 */
 		appendPQExpBuffer(q, "CREATE %s%s %s",
+						  tbinfo->relpersistence == RELPERSISTENCE_GLOBAL_TEMP ?
+						  "GLOBAL TEMPORARY " :
 						  (tbinfo->relpersistence == RELPERSISTENCE_UNLOGGED &&
 						   tbinfo->relkind != RELKIND_PARTITIONED_TABLE) ?
 						  "UNLOGGED " : "",
@@ -17709,6 +17741,15 @@ dumpTableSchema(Archive *fout, const TableInfo *tbinfo)
 		/* Dump generic options if any */
 		if (ftoptions && ftoptions[0])
 			appendPQExpBuffer(q, "\nOPTIONS (\n    %s\n)", ftoptions);
+
+		/* Emit ON COMMIT clause for global temporary tables */
+		if (tbinfo->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+		{
+			if (tbinfo->gtt_on_commit_delete)
+				appendPQExpBufferStr(q, "\nON COMMIT DELETE ROWS");
+			else
+				appendPQExpBufferStr(q, "\nON COMMIT PRESERVE ROWS");
+		}
 
 		/*
 		 * For materialized views, create the AS clause just like a view. At
@@ -19604,10 +19645,16 @@ dumpSequence(Archive *fout, const TableInfo *tbinfo)
 	}
 	else
 	{
+		const char *persistence_prefix = "";
+
+		if (tbinfo->relpersistence == RELPERSISTENCE_UNLOGGED)
+			persistence_prefix = "UNLOGGED ";
+		else if (tbinfo->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+			persistence_prefix = "GLOBAL TEMPORARY ";
+
 		appendPQExpBuffer(query,
 						  "CREATE %sSEQUENCE %s\n",
-						  tbinfo->relpersistence == RELPERSISTENCE_UNLOGGED ?
-						  "UNLOGGED " : "",
+						  persistence_prefix,
 						  fmtQualifiedDumpable(tbinfo));
 
 		if (seq->seqtype != SEQTYPE_BIGINT)

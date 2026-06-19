@@ -29,6 +29,7 @@
 #include "access/htup_details.h"
 #include "access/parallel.h"
 #include "catalog/pg_statistic.h"
+#include "catalog/storage_gtt.h"
 #include "commands/tablespace.h"
 #include "executor/executor.h"
 #include "executor/hashjoin.h"
@@ -2430,6 +2431,7 @@ ExecHashBuildSkewHash(HashState *hashstate, HashJoinTable hashtable,
 					  Hash *node, int mcvsToUse)
 {
 	HeapTupleData *statsTuple;
+	void		(*freeStatsTuple) (HeapTuple);
 	AttStatsSlot sslot;
 
 	/* Do nothing if planner didn't identify the outer relation's join key */
@@ -2442,10 +2444,11 @@ ExecHashBuildSkewHash(HashState *hashstate, HashJoinTable hashtable,
 	/*
 	 * Try to find the MCV statistics for the outer relation's join key.
 	 */
-	statsTuple = SearchSysCache3(STATRELATTINH,
-								 ObjectIdGetDatum(node->skewTable),
-								 Int16GetDatum(node->skewColumn),
-								 BoolGetDatum(node->skewInherit));
+	statsTuple = SearchStats(node->skewTable,
+							 node->skewColumn,
+							 node->skewInherit,
+							 true,
+							 &freeStatsTuple);
 	if (!HeapTupleIsValid(statsTuple))
 		return;
 
@@ -2471,7 +2474,7 @@ ExecHashBuildSkewHash(HashState *hashstate, HashJoinTable hashtable,
 		if (frac < SKEW_MIN_OUTER_FRACTION)
 		{
 			free_attstatsslot(&sslot);
-			ReleaseSysCache(statsTuple);
+			freeStatsTuple(statsTuple);
 			return;
 		}
 
@@ -2567,7 +2570,7 @@ ExecHashBuildSkewHash(HashState *hashstate, HashJoinTable hashtable,
 		free_attstatsslot(&sslot);
 	}
 
-	ReleaseSysCache(statsTuple);
+	freeStatsTuple(statsTuple);
 }
 
 /*

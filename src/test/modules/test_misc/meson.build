@@ -22,6 +22,10 @@ tests += {
       't/011_lock_stats.pl',
       't/012_ddlutils.pl',
       't/013_temp_obj_multisession.pl',
+      't/014_gtt_xid_horizon.pl',
+      't/015_gtt_stress.pl',
+      't/016_gtt_concurrency.pl',
+      't/017_gtt_crash.pl',
     ],
     # The injection points are cluster-wide, so disable installcheck
     'runningcheck': false,

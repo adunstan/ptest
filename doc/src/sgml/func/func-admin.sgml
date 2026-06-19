@@ -2071,6 +2071,33 @@ SELECT pg_restore_relation_stats(
       </row>
 
       <row>
+       <entry role="func_table_entry">
+        <para role="func_signature">
+         <indexterm>
+          <primary>pg_gtt_clear_stats</primary>
+         </indexterm>
+         <function>pg_gtt_clear_stats</function> ( <parameter>relid</parameter> <type>regclass</type> <literal>DEFAULT NULL</literal> )
+         <returnvalue>void</returnvalue>
+        </para>
+        <para>
+         Discards per-session relation- and column-level statistics for one
+         or all global temporary tables in the current session.  If
+         <parameter>relid</parameter> is not <literal>NULL</literal>,
+         only that table's statistics are cleared; otherwise statistics for
+         every global temporary table accessible to the session are cleared.
+         After clearing, the planner falls back to default estimates until
+         <command>ANALYZE</command> is run again in this session.
+        </para>
+        <para>
+         Unlike <function>pg_clear_relation_stats</function>, which modifies
+         shared statistics visible to all sessions, this function affects only
+         the calling session's private state, so
+         <literal>SELECT</literal> privilege on the table is sufficient.
+        </para>
+       </entry>
+      </row>
+
+      <row>
        <entry role="func_table_entry"><para role="func_signature">
         <indexterm>
          <primary>pg_restore_attribute_stats</primary>

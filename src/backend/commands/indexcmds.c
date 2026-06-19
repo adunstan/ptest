@@ -38,6 +38,7 @@
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
+#include "catalog/storage_gtt.h"
 #include "commands/comment.h"
 #include "commands/defrem.h"
 #include "commands/event_trigger.h"
@@ -556,6 +557,7 @@ DefineIndex(ParseState *pstate,
 			bool quiet)
 {
 	bool		concurrent;
+	char		persistence;
 	char	   *indexRelationName;
 	char	   *accessMethodName;
 	Oid		   *typeIds;
@@ -615,11 +617,41 @@ DefineIndex(ParseState *pstate,
 	 * there's no harm in grabbing a stronger lock, and a non-concurrent DROP
 	 * is more efficient.  Do this before any use of the concurrent option is
 	 * done.
+	 *
+	 * Similarly, global temporary tables have per-session local storage that
+	 * other backends cannot see, so concurrent builds are neither necessary
+	 * nor safe (the multi-transaction protocol would operate on the shared
+	 * catalog without matching per-session data).
 	 */
-	if (stmt->concurrent && get_rel_persistence(tableId) != RELPERSISTENCE_TEMP)
-		concurrent = true;
-	else
-		concurrent = false;
+	persistence = get_rel_persistence(tableId);
+
+	/*
+	 * Tell the user when we've silently downgraded a CONCURRENTLY request for
+	 * a global temporary table.  Scripts that rely on CONCURRENTLY for
+	 * minimum downtime would otherwise have no way to know the fallback
+	 * happened.
+	 */
+	if (stmt->concurrent && persistence == RELPERSISTENCE_GLOBAL_TEMP)
+		ereport(NOTICE,
+				errmsg("CREATE INDEX CONCURRENTLY is not supported for global temporary tables"),
+				errdetail("Falling back to a non-concurrent build."));
+
+	concurrent = stmt->concurrent &&
+		persistence != RELPERSISTENCE_TEMP &&
+		persistence != RELPERSISTENCE_GLOBAL_TEMP;
+
+	/*
+	 * For a direct CREATE INDEX on a global temporary table, refuse the
+	 * command if any peer session has live per-session data.  A new UNIQUE
+	 * index on a column with cross-session duplicates would later make the
+	 * peer's data inaccessible (its lazy build would fail with a
+	 * duplicate-key error); even a non-unique index changes planner choices
+	 * in surprising ways for the peer.  ALTER TABLE ADD CONSTRAINT reaches
+	 * DefineIndex with is_alter_table = true, and ATController has already
+	 * done the same check.
+	 */
+	if (!is_alter_table && persistence == RELPERSISTENCE_GLOBAL_TEMP)
+		GttCheckAlterable(tableId);
 
 	/*
 	 * Start progress report.  If we're building a partition, this was already
@@ -2981,11 +3013,18 @@ ReindexIndex(const ReindexStmt *stmt, const ReindexParams *params, bool isTopLev
 	if (relkind == RELKIND_PARTITIONED_INDEX)
 		ReindexPartitions(stmt, indOid, params, isTopLevel);
 	else if ((params->options & REINDEXOPT_CONCURRENTLY) != 0 &&
-			 persistence != RELPERSISTENCE_TEMP)
+			 persistence != RELPERSISTENCE_TEMP &&
+			 persistence != RELPERSISTENCE_GLOBAL_TEMP)
 		ReindexRelationConcurrently(stmt, indOid, params);
 	else
 	{
 		ReindexParams newparams = *params;
+
+		if ((params->options & REINDEXOPT_CONCURRENTLY) != 0 &&
+			persistence == RELPERSISTENCE_GLOBAL_TEMP)
+			ereport(NOTICE,
+					errmsg("REINDEX CONCURRENTLY is not supported for global temporary tables"),
+					errdetail("Falling back to a non-concurrent reindex."));
 
 		newparams.options |= REINDEXOPT_REPORT_PROGRESS;
 		reindex_index(stmt, indOid, false, persistence, &newparams);
@@ -3077,6 +3116,7 @@ static Oid
 ReindexTable(const ReindexStmt *stmt, const ReindexParams *params, bool isTopLevel)
 {
 	Oid			heapOid;
+	char		persistence;
 	bool		result;
 	const RangeVar *relation = stmt->relation;
 
@@ -3094,10 +3134,13 @@ ReindexTable(const ReindexStmt *stmt, const ReindexParams *params, bool isTopLev
 									   0,
 									   RangeVarCallbackMaintainsTable, NULL);
 
+	persistence = get_rel_persistence(heapOid);
+
 	if (get_rel_relkind(heapOid) == RELKIND_PARTITIONED_TABLE)
 		ReindexPartitions(stmt, heapOid, params, isTopLevel);
 	else if ((params->options & REINDEXOPT_CONCURRENTLY) != 0 &&
-			 get_rel_persistence(heapOid) != RELPERSISTENCE_TEMP)
+			 persistence != RELPERSISTENCE_TEMP &&
+			 persistence != RELPERSISTENCE_GLOBAL_TEMP)
 	{
 		result = ReindexRelationConcurrently(stmt, heapOid, params);
 
@@ -3109,6 +3152,12 @@ ReindexTable(const ReindexStmt *stmt, const ReindexParams *params, bool isTopLev
 	else
 	{
 		ReindexParams newparams = *params;
+
+		if ((params->options & REINDEXOPT_CONCURRENTLY) != 0 &&
+			persistence == RELPERSISTENCE_GLOBAL_TEMP)
+			ereport(NOTICE,
+					errmsg("REINDEX CONCURRENTLY is not supported for global temporary tables"),
+					errdetail("Falling back to a non-concurrent reindex."));
 
 		newparams.options |= REINDEXOPT_REPORT_PROGRESS;
 		result = reindex_relation(stmt, heapOid,
@@ -3248,6 +3297,14 @@ ReindexMultipleTables(const ReindexStmt *stmt, const ReindexParams *params)
 		/* Skip temp tables of other backends; we can't reindex them at all */
 		if (classtuple->relpersistence == RELPERSISTENCE_TEMP &&
 			!isTempNamespace(classtuple->relnamespace))
+			continue;
+
+		/*
+		 * Skip global temporary tables; they cannot be reindexed (see
+		 * reindex_index()), so we silently skip them here to avoid aborting a
+		 * database- or schema-wide REINDEX.
+		 */
+		if (classtuple->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
 			continue;
 
 		/*
@@ -3521,7 +3578,8 @@ ReindexMultipleInternal(const ReindexStmt *stmt, const List *relids, const Reind
 		Assert(!RELKIND_HAS_PARTITIONS(relkind));
 
 		if ((params->options & REINDEXOPT_CONCURRENTLY) != 0 &&
-			relpersistence != RELPERSISTENCE_TEMP)
+			relpersistence != RELPERSISTENCE_TEMP &&
+			relpersistence != RELPERSISTENCE_GLOBAL_TEMP)
 		{
 			ReindexParams newparams = *params;
 
@@ -3962,8 +4020,9 @@ ReindexRelationConcurrently(const ReindexStmt *stmt, Oid relationOid, const Rein
 		idx->tableId = RelationGetRelid(heapRel);
 		idx->amId = indexRel->rd_rel->relam;
 
-		/* This function shouldn't be called for temporary relations. */
-		if (indexRel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+		/* This function shouldn't be called for temporary or GTT relations. */
+		if (indexRel->rd_rel->relpersistence == RELPERSISTENCE_TEMP ||
+			RelationIsGlobalTemp(indexRel))
 			elog(ERROR, "cannot reindex a temporary table concurrently");
 
 		pgstat_progress_start_command(PROGRESS_COMMAND_CREATE_INDEX, idx->tableId);

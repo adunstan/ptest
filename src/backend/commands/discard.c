@@ -15,6 +15,7 @@
 
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "catalog/storage_gtt.h"
 #include "commands/async.h"
 #include "commands/discard.h"
 #include "commands/prepare.h"
@@ -47,6 +48,7 @@ DiscardCommand(DiscardStmt *stmt, bool isTopLevel)
 
 		case DISCARD_TEMP:
 			ResetTempTableNamespace();
+			GttResetAllSessionData();
 			break;
 
 		default:
@@ -75,5 +77,6 @@ DiscardAll(bool isTopLevel)
 	LockReleaseAll(USER_LOCKMETHOD, true);
 	ResetPlanCache();
 	ResetTempTableNamespace();
+	GttResetAllSessionData();
 	ResetSequenceCaches();
 }

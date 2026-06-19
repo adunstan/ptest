@@ -1187,6 +1187,12 @@ GroupingSet
 GroupingSetData
 GroupingSetKind
 GroupingSetsPath
+GttColStatsEntry
+GttColStatsKey
+GttSessionsEntry
+GttSessionsKey
+GttStorageEntry
+GttSwapUndo
 GucAction
 GucBoolAssignHook
 GucBoolCheckHook

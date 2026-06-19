@@ -36,6 +36,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_enum.h"
 #include "catalog/storage.h"
+#include "catalog/storage_gtt.h"
 #include "commands/async.h"
 #include "commands/tablecmds.h"
 #include "commands/trigger.h"
@@ -2352,6 +2353,9 @@ CommitTransaction(void)
 	 */
 	PreCommit_on_commit_actions();
 
+	/* Truncate ON COMMIT DELETE ROWS global temporary tables */
+	PreCommit_gtt_on_commit();
+
 	/*
 	 * Synchronize files that are created and not WAL-logged during this
 	 * transaction. This must happen before AtEOXact_RelationMap(), so that we
@@ -2613,6 +2617,12 @@ PrepareTransaction(void)
 	 * cursors, to avoid dangling-reference problems)
 	 */
 	PreCommit_on_commit_actions();
+
+	/*
+	 * No PreCommit_gtt_on_commit() here: any access to a GTT sets
+	 * XACT_FLAGS_ACCESSEDTEMPNAMESPACE, which makes the PREPARE fail just
+	 * below, so commit-time GTT truncation work would always be wasted.
+	 */
 
 	/*
 	 * Synchronize files that are created and not WAL-logged during this

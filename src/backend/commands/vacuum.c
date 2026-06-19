@@ -35,8 +35,10 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_inherits.h"
+#include "catalog/storage_gtt.h"
 #include "commands/async.h"
 #include "commands/defrem.h"
 #include "commands/progress.h"
@@ -1068,6 +1070,16 @@ get_all_vacuum_rels(MemoryContext vac_context, int options)
 			!isTempOrTempToastNamespace(classForm->relnamespace))
 			continue;
 
+		/*
+		 * Skip global temporary tables.  vacuum_rel() would skip them anyway,
+		 * but doing so silently here avoids emitting a stream of INFO
+		 * "skipping vacuum" messages on a database-wide VACUUM. A VACUUM that
+		 * names a GTT explicitly still reaches vacuum_rel() and is reported
+		 * there.
+		 */
+		if (classForm->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+			continue;
+
 		/* check permissions of relation */
 		if (!vacuum_is_permitted_for_relation(relid, classForm, options))
 			continue;
@@ -1124,9 +1136,29 @@ vacuum_get_cutoffs(Relation rel, const VacuumParams *params,
 	freeze_table_age = params->freeze_table_age;
 	multixact_freeze_table_age = params->multixact_freeze_table_age;
 
-	/* Set pg_class fields in cutoffs */
-	cutoffs->relfrozenxid = rel->rd_rel->relfrozenxid;
-	cutoffs->relminmxid = rel->rd_rel->relminmxid;
+	/*
+	 * Set the starting relfrozenxid/relminmxid cutoffs for the relation.
+	 *
+	 * A global temporary table carries invalid values in its shared pg_class
+	 * row -- they are common to all sessions, but the data is per session --
+	 * so we take the cutoffs from this session's freeze horizon instead.  The
+	 * new horizon this VACUUM computes is written back there, not to pg_class
+	 * (see vac_update_relstats).  vacuum_rel() ensures a GTT with no session
+	 * data never reaches here.
+	 */
+	if (RelationIsGlobalTemp(rel))
+	{
+		if (!GttGetSessionFrozenXids(RelationGetRelid(rel),
+									 &cutoffs->relfrozenxid,
+									 &cutoffs->relminmxid))
+			elog(ERROR, "no session freeze horizon for global temporary table \"%s\"",
+				 RelationGetRelationName(rel));
+	}
+	else
+	{
+		cutoffs->relfrozenxid = rel->rd_rel->relfrozenxid;
+		cutoffs->relminmxid = rel->rd_rel->relminmxid;
+	}
 
 	/*
 	 * Acquire OldestXmin.
@@ -1449,6 +1481,21 @@ vac_update_relstats(Relation relation,
 				futuremxid;
 	TransactionId oldfrozenxid;
 	MultiXactId oldminmulti;
+
+	/*
+	 * Global temporary tables keep their whole-relation statistics and freeze
+	 * horizon per session; the shared pg_class row is meaningless across
+	 * sessions and must never be written here.  Persist the freeze cutoffs
+	 * this VACUUM produced into the per-session storage instead. (Per-session
+	 * relpages/reltuples are maintained separately by ANALYZE, which never
+	 * routes through this function for a GTT.)
+	 */
+	if (RelationIsGlobalTemp(relation))
+	{
+		GttUpdateSessionFrozenXids(relid, frozenxid, minmulti,
+								   frozenxid_updated, minmulti_updated);
+		return;
+	}
 
 	rd = table_open(RelationRelationId, RowExclusiveLock);
 
@@ -2153,6 +2200,74 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 		return false;
+	}
+
+	/*
+	 * A global temporary table's data lives in per-session local storage that
+	 * behaves like a regular temp table's, so we can freeze it in place. What
+	 * differs is the bookkeeping: a GTT's shared pg_class row carries invalid
+	 * relfrozenxid/relminmxid (it is common to all sessions), so the starting
+	 * cutoffs come from, and the new horizon is written back to, this
+	 * session's per-session state instead (see vacuum_get_cutoffs /
+	 * vac_update_relstats).
+	 *
+	 * If this session has never written data to the table there is nothing to
+	 * vacuum; skip the vacuum portion.  When ANALYZE was also requested
+	 * (VACUUM (ANALYZE)) we still return true so the caller runs analyze_rel.
+	 */
+	if (RelationIsGlobalTemp(rel))
+	{
+		TransactionId session_relfrozenxid;
+		MultiXactId session_relminmxid;
+
+		/*
+		 * VACUUM FULL reassigns the shared relfilenode, which would
+		 * desynchronize every session's per-session storage, so it is
+		 * unsupported for GTTs.  Reject it here -- regardless of whether this
+		 * session holds data -- rather than letting it reach the repack path,
+		 * both so the outcome doesn't depend on the current session's data
+		 * and so the message can make clear that plain VACUUM is the
+		 * supported way to maintain a GTT.
+		 */
+		if (params.options & VACOPT_FULL)
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cannot execute VACUUM FULL on global temporary tables"),
+					errhint("Plain VACUUM freezes a global temporary table's session-local data in place."));
+
+		/*
+		 * If this session has never written data to the table there is
+		 * nothing to vacuum; skip the vacuum portion.  When ANALYZE was also
+		 * requested (VACUUM (ANALYZE)) we still return true so the caller
+		 * runs analyze_rel.
+		 */
+		if (!GttGetSessionFrozenXids(RelationGetRelid(rel),
+									 &session_relfrozenxid,
+									 &session_relminmxid))
+		{
+			bool		can_analyze = (params.options & VACOPT_ANALYZE) != 0;
+			int			elevel;
+
+			/*
+			 * Tell the user we are skipping the relation they named -- but
+			 * not for a toast table reached via its parent: vacuuming a GTT
+			 * that simply has no toasted values would otherwise emit a
+			 * confusing message about an internal pg_toast relation.
+			 */
+			if (can_analyze || IsToastRelation(rel))
+				elevel = DEBUG1;
+			else
+				elevel = INFO;
+
+			ereport(elevel,
+					errmsg("skipping vacuum of \"%s\" --- this session has no data for the global temporary table",
+						   RelationGetRelationName(rel)));
+			relation_close(rel, lmode);
+			PopActiveSnapshot();
+			CommitTransactionCommand();
+			return can_analyze;
+		}
+		/* otherwise fall through and vacuum this session's storage */
 	}
 
 	/*

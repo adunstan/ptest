@@ -28,7 +28,9 @@
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_inherits.h"
+#include "catalog/storage_gtt.h"
 #include "commands/progress.h"
 #include "commands/tablecmds.h"
 #include "commands/vacuum.h"
@@ -94,7 +96,10 @@ static int	acquire_inherited_sample_rows(Relation onerel, int elevel,
 										  HeapTuple *rows, int targrows,
 										  double *totalrows, double *totaldeadrows);
 static void update_attstats(Oid relid, bool inh,
-							int natts, VacAttrStats **vacattrstats);
+							int natts, VacAttrStats **vacattrstats,
+							bool is_gtt);
+static HeapTuple build_statstuple(Oid relid, bool inh,
+								  VacAttrStats *stats, TupleDesc tupdesc);
 static Datum std_fetch_func(VacAttrStatsP stats, int rownum, bool *isNull);
 static Datum ind_fetch_func(VacAttrStatsP stats, int rownum, bool *isNull);
 
@@ -316,7 +321,8 @@ do_analyze_rel(Relation onerel, const VacuumParams *params,
 	int			nindexes;
 	bool		verbose,
 				instrument,
-				hasindex;
+				hasindex,
+				is_gtt;
 	VacAttrStats **vacattrstats;
 	AnlIndexData *indexdata;
 	int			targrows,
@@ -340,6 +346,7 @@ do_analyze_rel(Relation onerel, const VacuumParams *params,
 	verbose = (params->options & VACOPT_VERBOSE) != 0;
 	instrument = (verbose || (AmAutoVacuumWorkerProcess() &&
 							  params->log_analyze_min_duration >= 0));
+	is_gtt = (RelationIsGlobalTemp(onerel));
 	if (inh)
 		ereport(elevel,
 				(errmsg("analyzing \"%s.%s\" inheritance tree",
@@ -608,21 +615,27 @@ do_analyze_rel(Relation onerel, const VacuumParams *params,
 		 * Emit the completed stats rows into pg_statistic, replacing any
 		 * previous statistics for the target columns.  (If there are stats in
 		 * pg_statistic for columns we didn't process, we leave them alone.)
+		 *
+		 * For global temporary tables, update_attstats stores the per-column
+		 * stats in backend-local memory instead of writing pg_statistic, so
+		 * each session sees its own sample.  Extended statistics are not
+		 * supported for GTTs and are skipped.
 		 */
 		update_attstats(RelationGetRelid(onerel), inh,
-						attr_cnt, vacattrstats);
+						attr_cnt, vacattrstats, is_gtt);
 
 		for (ind = 0; ind < nindexes; ind++)
 		{
 			AnlIndexData *thisdata = &indexdata[ind];
 
 			update_attstats(RelationGetRelid(Irel[ind]), false,
-							thisdata->attr_cnt, thisdata->vacattrstats);
+							thisdata->attr_cnt, thisdata->vacattrstats,
+							is_gtt);
 		}
 
-		/* Build extended statistics (if there are any). */
-		BuildRelationExtStatistics(onerel, inh, totalrows, numrows, rows,
-								   attr_cnt, vacattrstats);
+		if (!is_gtt)
+			BuildRelationExtStatistics(onerel, inh, totalrows, numrows, rows,
+									   attr_cnt, vacattrstats);
 	}
 
 	pgstat_progress_update_param(PROGRESS_ANALYZE_PHASE,
@@ -650,18 +663,29 @@ do_analyze_rel(Relation onerel, const VacuumParams *params,
 		/*
 		 * Update pg_class for table relation.  CCI first, in case acquirefunc
 		 * updated pg_class.
+		 *
+		 * For global temporary tables, store page/tuple statistics in the
+		 * per-session hash instead of pg_class: the shared catalog values
+		 * would be meaningless since each session has its own private data.
+		 * The planner reads them back via GttGetSessionStats().
 		 */
-		CommandCounterIncrement();
-		vac_update_relstats(onerel,
-							relpages,
-							totalrows,
-							relallvisible,
-							relallfrozen,
-							hasindex,
-							InvalidTransactionId,
-							InvalidMultiXactId,
-							NULL, NULL,
-							in_outer_xact);
+		if (is_gtt)
+			GttUpdateSessionStats(RelationGetRelid(onerel),
+								  relpages, totalrows, relallvisible);
+		else
+		{
+			CommandCounterIncrement();
+			vac_update_relstats(onerel,
+								relpages,
+								totalrows,
+								relallvisible,
+								relallfrozen,
+								hasindex,
+								InvalidTransactionId,
+								InvalidMultiXactId,
+								NULL, NULL,
+								in_outer_xact);
+		}
 
 		/* Same for indexes */
 		for (ind = 0; ind < nindexes; ind++)
@@ -670,15 +694,20 @@ do_analyze_rel(Relation onerel, const VacuumParams *params,
 			double		totalindexrows;
 
 			totalindexrows = ceil(thisdata->tupleFract * totalrows);
-			vac_update_relstats(Irel[ind],
-								RelationGetNumberOfBlocks(Irel[ind]),
-								totalindexrows,
-								0, 0,
-								false,
-								InvalidTransactionId,
-								InvalidMultiXactId,
-								NULL, NULL,
-								in_outer_xact);
+			if (is_gtt)
+				GttUpdateSessionStats(RelationGetRelid(Irel[ind]),
+									  RelationGetNumberOfBlocks(Irel[ind]),
+									  totalindexrows, 0);
+			else
+				vac_update_relstats(Irel[ind],
+									RelationGetNumberOfBlocks(Irel[ind]),
+									totalindexrows,
+									0, 0,
+									false,
+									InvalidTransactionId,
+									InvalidMultiXactId,
+									NULL, NULL,
+									in_outer_xact);
 		}
 	}
 	else if (onerel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
@@ -1689,6 +1718,93 @@ acquire_inherited_sample_rows(Relation onerel, int elevel,
 
 
 /*
+ * build_statstuple
+ *		Build a pg_statistic-format HeapTuple from a VacAttrStats.
+ *
+ * The tuple, and sizable intermediate arrays, are allocated in the current
+ * memory context.  A caller that needs the tuple to live beyond the current
+ * transaction should copy it (heap_copytuple) into the longer-lived context
+ * rather than build there, so the intermediates don't leak into it.
+ */
+static HeapTuple
+build_statstuple(Oid relid, bool inh, VacAttrStats *stats, TupleDesc tupdesc)
+{
+	int			i,
+				k,
+				n;
+	Datum		values[Natts_pg_statistic];
+	bool		nulls[Natts_pg_statistic];
+
+	for (i = 0; i < Natts_pg_statistic; ++i)
+		nulls[i] = false;
+
+	values[Anum_pg_statistic_starelid - 1] = ObjectIdGetDatum(relid);
+	values[Anum_pg_statistic_staattnum - 1] = Int16GetDatum(stats->tupattnum);
+	values[Anum_pg_statistic_stainherit - 1] = BoolGetDatum(inh);
+	values[Anum_pg_statistic_stanullfrac - 1] = Float4GetDatum(stats->stanullfrac);
+	values[Anum_pg_statistic_stawidth - 1] = Int32GetDatum(stats->stawidth);
+	values[Anum_pg_statistic_stadistinct - 1] = Float4GetDatum(stats->stadistinct);
+	i = Anum_pg_statistic_stakind1 - 1;
+	for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
+	{
+		values[i++] = Int16GetDatum(stats->stakind[k]); /* stakindN */
+	}
+	i = Anum_pg_statistic_staop1 - 1;
+	for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
+	{
+		values[i++] = ObjectIdGetDatum(stats->staop[k]);	/* staopN */
+	}
+	i = Anum_pg_statistic_stacoll1 - 1;
+	for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
+	{
+		values[i++] = ObjectIdGetDatum(stats->stacoll[k]);	/* stacollN */
+	}
+	i = Anum_pg_statistic_stanumbers1 - 1;
+	for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
+	{
+		if (stats->stanumbers[k] != NULL)
+		{
+			int			nnum = stats->numnumbers[k];
+			Datum	   *numdatums = (Datum *) palloc(nnum * sizeof(Datum));
+			ArrayType  *arry;
+
+			for (n = 0; n < nnum; n++)
+				numdatums[n] = Float4GetDatum(stats->stanumbers[k][n]);
+			arry = construct_array_builtin(numdatums, nnum, FLOAT4OID);
+			values[i++] = PointerGetDatum(arry);	/* stanumbersN */
+		}
+		else
+		{
+			nulls[i] = true;
+			values[i++] = (Datum) 0;
+		}
+	}
+	i = Anum_pg_statistic_stavalues1 - 1;
+	for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
+	{
+		if (stats->stavalues[k] != NULL)
+		{
+			ArrayType  *arry;
+
+			arry = construct_array(stats->stavalues[k],
+								   stats->numvalues[k],
+								   stats->statypid[k],
+								   stats->statyplen[k],
+								   stats->statypbyval[k],
+								   stats->statypalign[k]);
+			values[i++] = PointerGetDatum(arry);	/* stavaluesN */
+		}
+		else
+		{
+			nulls[i] = true;
+			values[i++] = (Datum) 0;
+		}
+	}
+
+	return heap_form_tuple(tupdesc, values, nulls);
+}
+
+/*
  *	update_attstats() -- update attribute statistics for one relation
  *
  *		Statistics are stored in several places: the pg_class row for the
@@ -1709,106 +1825,62 @@ acquire_inherited_sample_rows(Relation onerel, int elevel,
  *		Note: there would be a race condition here if two backends could
  *		ANALYZE the same table concurrently.  Presently, we lock that out
  *		by taking a self-exclusive lock on the relation in analyze_rel().
+ *
+ *		For global temporary tables (is_gtt == true) the caller wants
+ *		session-private statistics, so we build the tuples in
+ *		TopMemoryContext and store them in the backend-local GTT
+ *		column-stats hash instead of pg_statistic.  pg_statistic is opened
+ *		either way: to get a RowExclusiveLock for writing, or an
+ *		AccessShareLock for its TupleDesc.
  */
 static void
-update_attstats(Oid relid, bool inh, int natts, VacAttrStats **vacattrstats)
+update_attstats(Oid relid, bool inh, int natts, VacAttrStats **vacattrstats,
+				bool is_gtt)
 {
 	Relation	sd;
+	LOCKMODE	lockmode = is_gtt ? AccessShareLock : RowExclusiveLock;
 	int			attno;
 	CatalogIndexState indstate = NULL;
+	MemoryContext oldcxt;
 
 	if (natts <= 0)
 		return;					/* nothing to do */
 
-	sd = table_open(StatisticRelationId, RowExclusiveLock);
+	sd = table_open(StatisticRelationId, lockmode);
 
 	for (attno = 0; attno < natts; attno++)
 	{
 		VacAttrStats *stats = vacattrstats[attno];
 		HeapTuple	stup,
 					oldtup;
-		int			i,
-					k,
-					n;
-		Datum		values[Natts_pg_statistic];
-		bool		nulls[Natts_pg_statistic];
-		bool		replaces[Natts_pg_statistic];
 
 		/* Ignore attr if we weren't able to collect stats */
 		if (!stats->stats_valid)
 			continue;
 
-		/*
-		 * Construct a new pg_statistic tuple
-		 */
-		for (i = 0; i < Natts_pg_statistic; ++i)
+		if (is_gtt)
 		{
-			nulls[i] = false;
-			replaces[i] = true;
+			HeapTuple	stup_copy;
+
+			/*
+			 * GTT stats tuples outlive the current memory context: they are
+			 * owned by the backend-local hash in TopMemoryContext.  Build the
+			 * tuple in the current (transaction-lifetime) context, so the
+			 * sizable intermediate arrays build_statstuple creates are
+			 * reclaimed with it, and copy only the finished tuple into
+			 * TopMemoryContext.
+			 */
+			stup = build_statstuple(relid, inh, stats, RelationGetDescr(sd));
+			oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+			stup_copy = heap_copytuple(stup);
+			MemoryContextSwitchTo(oldcxt);
+			heap_freetuple(stup);
+
+			GttStoreSessionColumnStats(relid, stats->tupattnum, inh, stup_copy);
+			continue;
 		}
 
-		values[Anum_pg_statistic_starelid - 1] = ObjectIdGetDatum(relid);
-		values[Anum_pg_statistic_staattnum - 1] = Int16GetDatum(stats->tupattnum);
-		values[Anum_pg_statistic_stainherit - 1] = BoolGetDatum(inh);
-		values[Anum_pg_statistic_stanullfrac - 1] = Float4GetDatum(stats->stanullfrac);
-		values[Anum_pg_statistic_stawidth - 1] = Int32GetDatum(stats->stawidth);
-		values[Anum_pg_statistic_stadistinct - 1] = Float4GetDatum(stats->stadistinct);
-		i = Anum_pg_statistic_stakind1 - 1;
-		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
-		{
-			values[i++] = Int16GetDatum(stats->stakind[k]); /* stakindN */
-		}
-		i = Anum_pg_statistic_staop1 - 1;
-		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
-		{
-			values[i++] = ObjectIdGetDatum(stats->staop[k]);	/* staopN */
-		}
-		i = Anum_pg_statistic_stacoll1 - 1;
-		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
-		{
-			values[i++] = ObjectIdGetDatum(stats->stacoll[k]);	/* stacollN */
-		}
-		i = Anum_pg_statistic_stanumbers1 - 1;
-		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
-		{
-			if (stats->stanumbers[k] != NULL)
-			{
-				int			nnum = stats->numnumbers[k];
-				Datum	   *numdatums = (Datum *) palloc(nnum * sizeof(Datum));
-				ArrayType  *arry;
-
-				for (n = 0; n < nnum; n++)
-					numdatums[n] = Float4GetDatum(stats->stanumbers[k][n]);
-				arry = construct_array_builtin(numdatums, nnum, FLOAT4OID);
-				values[i++] = PointerGetDatum(arry);	/* stanumbersN */
-			}
-			else
-			{
-				nulls[i] = true;
-				values[i++] = (Datum) 0;
-			}
-		}
-		i = Anum_pg_statistic_stavalues1 - 1;
-		for (k = 0; k < STATISTIC_NUM_SLOTS; k++)
-		{
-			if (stats->stavalues[k] != NULL)
-			{
-				ArrayType  *arry;
-
-				arry = construct_array(stats->stavalues[k],
-									   stats->numvalues[k],
-									   stats->statypid[k],
-									   stats->statyplen[k],
-									   stats->statypbyval[k],
-									   stats->statypalign[k]);
-				values[i++] = PointerGetDatum(arry);	/* stavaluesN */
-			}
-			else
-			{
-				nulls[i] = true;
-				values[i++] = (Datum) 0;
-			}
-		}
+		stup = build_statstuple(relid, inh, stats, RelationGetDescr(sd));
 
 		/* Is there already a pg_statistic tuple for this attribute? */
 		oldtup = SearchSysCache3(STATRELATTINH,
@@ -1822,19 +1894,23 @@ update_attstats(Oid relid, bool inh, int natts, VacAttrStats **vacattrstats)
 
 		if (HeapTupleIsValid(oldtup))
 		{
-			/* Yes, replace it */
-			stup = heap_modify_tuple(oldtup,
-									 RelationGetDescr(sd),
-									 values,
-									 nulls,
-									 replaces);
-			ReleaseSysCache(oldtup);
+			/*
+			 * Yes, replace it.  Preserve the old tuple's header fields
+			 * (t_self, t_ctid, t_tableOid) as heap_modify_tuple did before
+			 * build_statstuple was extracted; heap_update doesn't strictly
+			 * require all three, but keeping them consistent with the
+			 * previous behavior avoids surprises for any caller that inspects
+			 * them.
+			 */
+			stup->t_self = oldtup->t_self;
+			stup->t_data->t_ctid = oldtup->t_data->t_ctid;
+			stup->t_tableOid = oldtup->t_tableOid;
 			CatalogTupleUpdateWithInfo(sd, &stup->t_self, stup, indstate);
+			ReleaseSysCache(oldtup);
 		}
 		else
 		{
 			/* No, insert new tuple */
-			stup = heap_form_tuple(RelationGetDescr(sd), values, nulls);
 			CatalogTupleInsertWithInfo(sd, stup, indstate);
 		}
 
@@ -1843,7 +1919,7 @@ update_attstats(Oid relid, bool inh, int natts, VacAttrStats **vacattrstats)
 
 	if (indstate != NULL)
 		CatalogCloseIndexes(indstate);
-	table_close(sd, RowExclusiveLock);
+	table_close(sd, lockmode);
 }
 
 /*

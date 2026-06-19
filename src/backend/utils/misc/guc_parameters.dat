@@ -1205,6 +1205,15 @@
   max => 'MAX_KILOBYTES',
 },
 
+{ name => 'global_temp_xid_warn_margin', type => 'int', context => 'PGC_USERSET', group => 'CLIENT_CONN_STATEMENT',
+  short_desc => 'Transaction-ID head room before warning that global temporary table data is aging toward wraparound.',
+  long_desc => 'A warning is issued when the oldest unfrozen row in a global temporary table accessed by this session comes within this many transactions of the cluster commit-log truncation horizon. A hard error is always raised at the horizon itself, independently of this setting.',
+  variable => 'global_temp_xid_warn_margin',
+  boot_val => '100000000',
+  min => '0',
+  max => '2000000000',
+},
+
 { name => 'gss_accept_delegation', type => 'bool', context => 'PGC_SIGHUP', group => 'CONN_AUTH_AUTH',
   short_desc => 'Sets whether GSSAPI delegation should be accepted from the client.',
   variable => 'pg_gss_accept_delegation',

@@ -64,6 +64,7 @@
 #include "catalog/pg_type.h"
 #include "catalog/schemapg.h"
 #include "catalog/storage.h"
+#include "catalog/storage_gtt.h"
 #include "commands/policy.h"
 #include "commands/publicationcmds.h"
 #include "commands/trigger.h"
@@ -1161,6 +1162,20 @@ retry:
 			relation->rd_backend = INVALID_PROC_NUMBER;
 			relation->rd_islocaltemp = false;
 			break;
+		case RELPERSISTENCE_GLOBAL_TEMP:
+
+			/*
+			 * GTT data is per-session: no other backend can see our rows.
+			 * Mark rd_islocaltemp so callers keyed off that flag (the
+			 * read-only-xact gate in COPY, extension-lock skips in hio.c and
+			 * the AM vacuum paths, etc.) treat GTTs consistently with regular
+			 * temp tables.  rd_backend is left INVALID_PROC_NUMBER here and
+			 * will be set to ProcNumberForTempRelations by
+			 * GttInitSessionStorage when physical-address init runs.
+			 */
+			relation->rd_backend = INVALID_PROC_NUMBER;
+			relation->rd_islocaltemp = true;
+			break;
 		case RELPERSISTENCE_TEMP:
 			if (isTempOrTempToastNamespace(relation->rd_rel->relnamespace))
 			{
@@ -1339,6 +1354,16 @@ RelationInitPhysicalAddr(Relation relation)
 	/* these relations kinds never have storage */
 	if (!RELKIND_HAS_STORAGE(relation->rd_rel->relkind))
 		return;
+
+	/*
+	 * Global temporary tables use per-session local storage.  Redirect the
+	 * relation's physical address to the session-local file.
+	 */
+	if (RelationIsGlobalTemp(relation))
+	{
+		GttInitSessionStorage(relation);
+		return;
+	}
 
 	if (relation->rd_rel->reltablespace)
 		relation->rd_locator.spcOid = relation->rd_rel->reltablespace;
@@ -3656,6 +3681,16 @@ RelationBuildLocalRelation(const char *relname,
 			rel->rd_backend = INVALID_PROC_NUMBER;
 			rel->rd_islocaltemp = false;
 			break;
+		case RELPERSISTENCE_GLOBAL_TEMP:
+
+			/*
+			 * As in RelationBuildDesc: GTT data is per-session, so mark
+			 * rd_islocaltemp; rd_backend is set by GttInitSessionStorage when
+			 * physical-address init runs.
+			 */
+			rel->rd_backend = INVALID_PROC_NUMBER;
+			rel->rd_islocaltemp = true;
+			break;
 		case RELPERSISTENCE_TEMP:
 			Assert(isTempOrTempToastNamespace(relnamespace));
 			rel->rd_backend = ProcNumberForTempRelations();
@@ -3813,6 +3848,48 @@ RelationSetNewRelfilenumber(Relation relation, char persistence)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("unexpected request for new relfilenumber in binary upgrade mode")));
+
+	/*
+	 * Global temporary tables: the shared pg_class row must keep its
+	 * relfilenode, because every session derives its private storage path
+	 * from it.  Swap only this session's private storage for a new, empty
+	 * file.  The file-level work is transactional through the same
+	 * pending-delete entries as the regular path; the session-local mapping
+	 * is reverted on abort by the undo log in storage_gtt.c.
+	 */
+	if (RelationIsGlobalTemp(relation))
+	{
+		/* GTTs cannot change persistence (ALTER SET LOGGED etc. is blocked) */
+		Assert(persistence == RELPERSISTENCE_GLOBAL_TEMP);
+
+		/* Schedule unlinking of the old per-session storage at commit. */
+		RelationDropStorage(relation);
+
+		newrlocator = relation->rd_locator;
+		newrlocator.relNumber = newrelfilenumber;
+
+		if (RELKIND_HAS_TABLE_AM(relation->rd_rel->relkind))
+		{
+			/* freezeXid/minmulti are tracked per session, not in pg_class */
+			table_relation_set_new_filelocator(relation, &newrlocator,
+											   persistence,
+											   &freezeXid, &minmulti);
+		}
+		else if (RELKIND_HAS_STORAGE(relation->rd_rel->relkind))
+		{
+			SMgrRelation srel;
+
+			srel = RelationCreateStorage(newrlocator, persistence, true);
+			smgrclose(srel);
+		}
+		else
+			elog(ERROR, "relation \"%s\" does not have storage",
+				 RelationGetRelationName(relation));
+
+		GttSetNewSessionRelfilenumber(relation, newrelfilenumber);
+		RelationAssumeNewRelfilelocator(relation);
+		return;
+	}
 
 	/*
 	 * Get a writable copy of the pg_class tuple for the given relation.

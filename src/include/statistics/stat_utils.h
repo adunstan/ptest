@@ -25,6 +25,7 @@ struct StatsArgInfo
 	Oid			argtype;
 };
 
+extern void stats_check_not_global_temp(Oid reloid, const char *relname);
 extern void stats_check_required_arg(FunctionCallInfo fcinfo,
 									 struct StatsArgInfo *arginfo,
 									 int argnum);

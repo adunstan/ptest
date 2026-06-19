@@ -42,6 +42,7 @@
 #include "access/xloginsert.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_database_d.h"
+#include "catalog/storage_gtt.h"
 #include "commands/vacuum.h"
 #include "executor/instrument_node.h"
 #include "pgstat.h"
@@ -1172,6 +1173,13 @@ heap_beginscan(Relation relation, Snapshot snapshot,
 	HeapScanDesc scan;
 
 	/*
+	 * Refuse to scan a global temporary table whose data has aged toward the
+	 * transaction-ID horizon.  Checked once here at scan start; that is
+	 * frequent enough since a single statement cannot move the horizon.
+	 */
+	GttPrepareAccess(relation, false);
+
+	/*
 	 * increment relation ref count while scanning relation
 	 *
 	 * This is just to make really sure the relcache entry won't go away while
@@ -1798,6 +1806,9 @@ heap_get_latest_tid(TableScanDesc sscan,
 	ItemPointerData ctid;
 	TransactionId priorXmax;
 
+	/* Refuse to walk a global temporary table whose data has aged out. */
+	GttPrepareAccess(relation, false);
+
 	/*
 	 * table_tuple_get_latest_tid() verified that the passed in tid is valid.
 	 * Assume that t_ctid links are valid however - there shouldn't be invalid
@@ -2010,6 +2021,9 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	Page		page;
 	Buffer		vmbuffer = InvalidBuffer;
 	bool		all_visible_cleared = false;
+
+	/* Refuse to extend a global temporary table whose data has aged out. */
+	GttPrepareAccess(relation, true);
 
 	/* Cheap, simplistic check that the tuple matches the rel's rowtype. */
 	Assert(HeapTupleHeaderGetNatts(tup->t_data) <=
@@ -2299,6 +2313,9 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 
 	/* currently not needed (thus unsupported) for heap_multi_insert() */
 	Assert(!(options & HEAP_INSERT_NO_LOGICAL));
+
+	/* Refuse to extend a global temporary table whose data has aged out. */
+	GttPrepareAccess(relation, true);
 
 	AssertHasSnapshotForToast(relation);
 
@@ -2740,6 +2757,9 @@ heap_delete(Relation relation, const ItemPointerData *tid,
 	Assert(ItemPointerIsValid(tid));
 
 	AssertHasSnapshotForToast(relation);
+
+	/* Refuse to touch a global temporary table whose data has aged out. */
+	GttPrepareAccess(relation, false);
 
 	/*
 	 * Forbid this during a parallel operation, lest it allocate a combo CID.
@@ -3252,6 +3272,9 @@ heap_update(Relation relation, const ItemPointerData *otid, HeapTuple newtup,
 		   RelationGetNumberOfAttributes(relation));
 
 	AssertHasSnapshotForToast(relation);
+
+	/* Refuse to touch a global temporary table whose data has aged out. */
+	GttPrepareAccess(relation, false);
 
 	/*
 	 * Forbid this during a parallel operation, lest it allocate a combo CID.

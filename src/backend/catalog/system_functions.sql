@@ -366,3 +366,41 @@ CREATE OR REPLACE FUNCTION ts_debug(document text,
 BEGIN ATOMIC
     SELECT * FROM ts_debug(get_current_ts_config(), $1);
 END;
+
+CREATE OR REPLACE FUNCTION pg_gtt_relstats(
+    relid regclass DEFAULT NULL,
+    OUT table_oid oid,
+    OUT table_name text,
+    OUT relpages int4,
+    OUT reltuples float4,
+    OUT relallvisible int4)
+ RETURNS SETOF record
+ LANGUAGE internal
+ VOLATILE CALLED ON NULL INPUT ROWS 10
+AS 'pg_gtt_relstats';
+
+CREATE OR REPLACE FUNCTION pg_gtt_colstats(
+    relid regclass DEFAULT NULL,
+    OUT table_oid oid,
+    OUT table_name text,
+    OUT attnum int2,
+    OUT attname text,
+    OUT inherited bool,
+    OUT null_frac float4,
+    OUT avg_width int4,
+    OUT n_distinct float4,
+    OUT most_common_vals text,
+    OUT most_common_freqs float4[],
+    OUT histogram_bounds text,
+    OUT correlation float4)
+ RETURNS SETOF record
+ LANGUAGE internal
+ VOLATILE CALLED ON NULL INPUT ROWS 10
+AS 'pg_gtt_colstats';
+
+CREATE OR REPLACE FUNCTION pg_gtt_clear_stats(
+    relid regclass DEFAULT NULL)
+ RETURNS void
+ LANGUAGE internal
+ VOLATILE CALLED ON NULL INPUT
+AS 'pg_gtt_clear_stats';

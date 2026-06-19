@@ -40,6 +40,7 @@
 #include "catalog/pg_range.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_subscription.h"
+#include "catalog/storage_gtt.h"
 #include "catalog/pg_transform.h"
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
@@ -3467,6 +3468,7 @@ get_attavgwidth(Oid relid, AttrNumber attnum)
 {
 	HeapTuple	tp;
 	int32		stawidth;
+	void		(*freefunc) (HeapTuple);
 
 	if (get_attavgwidth_hook)
 	{
@@ -3474,17 +3476,17 @@ get_attavgwidth(Oid relid, AttrNumber attnum)
 		if (stawidth > 0)
 			return stawidth;
 	}
-	tp = SearchSysCache3(STATRELATTINH,
-						 ObjectIdGetDatum(relid),
-						 Int16GetDatum(attnum),
-						 BoolGetDatum(false));
+
+	tp = SearchStats(relid, attnum, false, true, &freefunc);
 	if (HeapTupleIsValid(tp))
 	{
 		stawidth = ((Form_pg_statistic) GETSTRUCT(tp))->stawidth;
-		ReleaseSysCache(tp);
+		freefunc	(tp);
+
 		if (stawidth > 0)
 			return stawidth;
 	}
+
 	return 0;
 }
 

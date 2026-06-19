@@ -56,6 +56,7 @@
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
 #include "catalog/storage.h"
+#include "catalog/storage_gtt.h"
 #include "catalog/storage_xlog.h"
 #include "catalog/toasting.h"
 #include "commands/comment.h"
@@ -397,6 +398,7 @@ typedef struct PartitionIndexExtDepEntry
 	((child_is_partition) ? DEPENDENCY_AUTO : DEPENDENCY_NORMAL)
 
 static void truncate_check_rel(Oid relid, Form_pg_class reltuple);
+static void CheckInternalGttReloption(List *options);
 static void truncate_check_perms(Oid relid, Form_pg_class reltuple);
 static void truncate_check_activity(Relation rel);
 static void RangeVarCallbackForTruncate(const RangeVar *relation,
@@ -787,6 +789,28 @@ static List *collectPartitionIndexExtDeps(List *partitionOids);
 static void applyPartitionIndexExtDeps(Oid newPartOid, List *extDepState);
 static void freePartitionIndexExtDeps(List *extDepState);
 
+/*
+ * CheckInternalGttReloption
+ *		Reject user-supplied settings of internal GTT reloptions.
+ *
+ * The on_commit_delete reloption is internal: it persists the ON COMMIT
+ * DELETE ROWS action for a global temporary table so other sessions can
+ * discover it.  Users must not set or reset it directly via CREATE TABLE
+ * ... WITH (...) or ALTER TABLE SET/RESET (...).
+ */
+static void
+CheckInternalGttReloption(List *options)
+{
+	foreach_node(DefElem, def, options)
+	{
+		if (strcmp(def->defname, "on_commit_delete") == 0)
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("on_commit_delete is an internal reloption and cannot be set directly"),
+					errhint("Use ON COMMIT DELETE ROWS when creating a global temporary table."));
+	}
+}
+
 /* ----------------------------------------------------------------
  *		DefineRelation
  *				Creates a new relation.
@@ -843,10 +867,16 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	 * Check consistency of arguments
 	 */
 	if (stmt->oncommit != ONCOMMIT_NOOP
-		&& stmt->relation->relpersistence != RELPERSISTENCE_TEMP)
+		&& !RELPERSISTENCE_IS_LOCAL(stmt->relation->relpersistence))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
 				 errmsg("ON COMMIT can only be used on temporary tables")));
+
+	if (stmt->oncommit == ONCOMMIT_DROP
+		&& stmt->relation->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+		ereport(ERROR,
+				errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				errmsg("ON COMMIT DROP is not supported for global temporary tables"));
 
 	if (stmt->partspec != NULL)
 	{
@@ -973,6 +1003,22 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	if (!OidIsValid(ownerId))
 		ownerId = GetUserId();
 
+	/* Reject direct use of internal GTT reloptions */
+	CheckInternalGttReloption(stmt->options);
+
+	/*
+	 * For global temporary tables with ON COMMIT DELETE ROWS, persist the
+	 * on-commit action as a reloption so that other sessions can discover it.
+	 */
+	if (stmt->oncommit == ONCOMMIT_DELETE_ROWS
+		&& stmt->relation->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+	{
+		DefElem    *def = makeDefElem("on_commit_delete",
+									  (Node *) makeBoolean(true), -1);
+
+		stmt->options = lappend(stmt->options, def);
+	}
+
 	/*
 	 * Parse and validate reloptions, if any.
 	 */
@@ -1094,6 +1140,23 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 		if (RELKIND_HAS_TABLE_AM(relkind) && !OidIsValid(accessMethodId))
 			accessMethodId = get_table_am_oid(default_table_access_method, false);
 	}
+
+	/*
+	 * Global temporary tables rely on the heap table access method.  Their
+	 * per-session storage, local buffering, and tuple visibility handling are
+	 * all heap-specific (see storage_gtt.c), and the wraparound-safety
+	 * reasoning for GTTs assumes heap.  Reject any other access method --
+	 * whether requested with USING or inherited from
+	 * default_table_access_method -- rather than create a table that cannot
+	 * work correctly.
+	 */
+	if (stmt->relation->relpersistence == RELPERSISTENCE_GLOBAL_TEMP &&
+		OidIsValid(accessMethodId) &&
+		accessMethodId != HEAP_TABLE_AM_OID)
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("access method \"%s\" is not supported for global temporary tables",
+					   get_am_name(accessMethodId)));
 
 	/*
 	 * Create the relation.  Inherited defaults and CHECK constraints are
@@ -1702,9 +1765,26 @@ RemoveRelations(DropStmt *drop)
 		/*
 		 * Decide if concurrent mode needs to be used here or not.  The
 		 * callback retrieved the rel's persistence for us.
+		 *
+		 * Global temporary tables have per-session local storage that other
+		 * backends cannot see, so the multi-transaction concurrent protocol
+		 * is neither necessary nor safe.  Mirror the CREATE INDEX
+		 * CONCURRENTLY fallback in indexcmds.c: emit a NOTICE and proceed
+		 * with a non-concurrent drop, upgrading our lock from
+		 * ShareUpdateExclusiveLock to AccessExclusiveLock.  The final
+		 * heap_drop_with_catalog still passes through GttCheckDroppable, so
+		 * peers with live per-session storage block the drop either way.
 		 */
 		if (drop->concurrent &&
-			state.actual_relpersistence != RELPERSISTENCE_TEMP)
+			state.actual_relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+		{
+			ereport(NOTICE,
+					errmsg("DROP INDEX CONCURRENTLY is not supported for global temporary tables"),
+					errdetail("Falling back to a non-concurrent drop."));
+			LockRelationOid(relOid, AccessExclusiveLock);
+		}
+		else if (drop->concurrent &&
+				 state.actual_relpersistence != RELPERSISTENCE_TEMP)
 		{
 			Assert(list_length(drop->objects) == 1 &&
 				   drop->removeType == OBJECT_INDEX);
@@ -1894,6 +1974,97 @@ RangeVarCallbackForDropRelation(const RangeVar *rel, Oid relOid, Oid oldRelOid,
 		state->partParentOid = get_partition_parent(relOid, true);
 		if (OidIsValid(state->partParentOid))
 			LockRelationOid(state->partParentOid, AccessExclusiveLock);
+	}
+}
+
+/*
+ * GttTruncateInSession
+ *		Truncate this session's private storage for a global temporary table.
+ *
+ * Used by TRUNCATE and by DISCARD TEMP/ALL.  The caller must hold
+ * AccessExclusiveLock on the relation.  The truncation is transaction-safe:
+ * for a GTT, RelationSetNewRelfilenumber leaves the shared pg_class row
+ * alone and swaps only the session-local storage mapping (with undo on
+ * abort), so the catalog relfilenode that other sessions derive their
+ * storage paths from is unaffected and a ROLLBACK restores the rows.
+ */
+void
+GttTruncateInSession(Relation rel)
+{
+	Oid			toast_relid;
+	List	   *indexoids;
+	ListCell   *ind;
+
+	/*
+	 * Storage that was never materialized holds nothing to truncate, and the
+	 * swap below must not be the thing that materializes it.
+	 */
+	if (!GttHasSessionStorage(RelationGetRelid(rel)))
+		return;
+
+	/*
+	 * As in the regular TRUNCATE path, this may run in a serializable
+	 * transaction, in which case we must record a rw-conflict in to this
+	 * transaction from each transaction holding a predicate lock on the
+	 * table.
+	 */
+	CheckTableForSerializableConflictIn(rel);
+
+	/*
+	 * Transaction-safe truncation, GTT style: swap this session's private
+	 * storage for new, empty files, so a ROLLBACK restores the rows.  For a
+	 * GTT, RelationSetNewRelfilenumber leaves the shared pg_class row alone
+	 * and changes only the session-local storage mapping, so the catalog
+	 * relfilenode that other sessions derive their storage paths from is
+	 * unaffected.
+	 *
+	 * The indexes cannot go through reindex_relation (REINDEX is disallowed
+	 * for GTTs); instead swap each index's session storage for an empty file
+	 * too and let GttBuildIndexIfNeeded rebuild it on next access.  (Opening
+	 * an index here may lazily build it from the already-swapped heap before
+	 * we swap the index file; that wastes a little work but is rollback-safe,
+	 * because the abort path clears index_built for indexes built in the
+	 * aborted transaction after restoring the swapped-out mapping.)
+	 */
+	RelationSetNewRelfilenumber(rel, rel->rd_rel->relpersistence);
+
+	indexoids = RelationGetIndexList(rel);
+	foreach(ind, indexoids)
+	{
+		Relation	idxrel = relation_open(lfirst_oid(ind),
+										   AccessExclusiveLock);
+
+		/* unmaterialized per-session storage holds nothing to truncate */
+		if (GttHasSessionStorage(RelationGetRelid(idxrel)))
+			RelationSetNewRelfilenumber(idxrel,
+										idxrel->rd_rel->relpersistence);
+		relation_close(idxrel, NoLock);
+	}
+	list_free(indexoids);
+
+	/* The same for the toast table and its index, if any */
+	toast_relid = rel->rd_rel->reltoastrelid;
+	if (OidIsValid(toast_relid) && GttHasSessionStorage(toast_relid))
+	{
+		Relation	toastrel = relation_open(toast_relid,
+											 AccessExclusiveLock);
+
+		RelationSetNewRelfilenumber(toastrel,
+									toastrel->rd_rel->relpersistence);
+
+		indexoids = RelationGetIndexList(toastrel);
+		foreach(ind, indexoids)
+		{
+			Relation	idxrel = relation_open(lfirst_oid(ind),
+											   AccessExclusiveLock);
+
+			if (GttHasSessionStorage(RelationGetRelid(idxrel)))
+				RelationSetNewRelfilenumber(idxrel,
+											idxrel->rd_rel->relpersistence);
+			relation_close(idxrel, NoLock);
+		}
+		list_free(indexoids);
+		table_close(toastrel, NoLock);
 	}
 }
 
@@ -2252,9 +2423,19 @@ ExecuteTruncateGuts(List *explicit_rels,
 		 * a new relfilenumber in the current (sub)transaction, then we can
 		 * just truncate it in-place, because a rollback would cause the whole
 		 * table or the current physical file to be thrown away anyway.
+		 *
+		 * Global temporary tables always go through the session-local swap:
+		 * the in-place path (heap_truncate_one_rel) assumes the relation
+		 * tree's files all exist, but a GTT's toast relation or indexes may
+		 * be unmaterialized -- and a same-transaction TRUNCATE or CREATE
+		 * (which is how rd_newRelfilelocatorSubid/rd_createSubid get set
+		 * here) makes that state likely rather than exotic.
+		 * GttTruncateInSession skips unmaterialized members individually.
 		 */
-		if (rel->rd_createSubid == mySubid ||
-			rel->rd_newRelfilelocatorSubid == mySubid)
+		if (RelationIsGlobalTemp(rel))
+			GttTruncateInSession(rel);
+		else if (rel->rd_createSubid == mySubid ||
+				 rel->rd_newRelfilelocatorSubid == mySubid)
 		{
 			/* Immediate, non-rollbackable truncation is OK */
 			heap_truncate_one_rel(rel);
@@ -2761,22 +2942,35 @@ MergeAttributes(List *columns, const List *supers, char relpersistence,
 		 * that inheritance allows that case.
 		 */
 		if (is_partition &&
-			relation->rd_rel->relpersistence != RELPERSISTENCE_TEMP &&
-			relpersistence == RELPERSISTENCE_TEMP)
+			!RELPERSISTENCE_IS_LOCAL(relation->rd_rel->relpersistence) &&
+			RELPERSISTENCE_IS_LOCAL(relpersistence))
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("cannot create a temporary relation as partition of permanent relation \"%s\"",
 							RelationGetRelationName(relation))));
 
 		/* Permanent rels cannot inherit from temporary ones */
-		if (relpersistence != RELPERSISTENCE_TEMP &&
-			relation->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+		if (!RELPERSISTENCE_IS_LOCAL(relpersistence) &&
+			RELPERSISTENCE_IS_LOCAL(relation->rd_rel->relpersistence))
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg(!is_partition
 							? "cannot inherit from temporary relation \"%s\""
 							: "cannot create a permanent relation as partition of temporary relation \"%s\"",
 							RelationGetRelationName(relation))));
+
+		/*
+		 * Don't allow mixing global temporary tables with local temporary
+		 * tables in inheritance or partitioning hierarchies, in either
+		 * direction.
+		 */
+		if ((relpersistence == RELPERSISTENCE_GLOBAL_TEMP &&
+			 relation->rd_rel->relpersistence == RELPERSISTENCE_TEMP) ||
+			(relpersistence == RELPERSISTENCE_TEMP &&
+			 RelationIsGlobalTemp(relation)))
+			ereport(ERROR,
+					errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					errmsg("cannot mix global temporary and local temporary tables in inheritance"));
 
 		/* If existing rel is temp, it must belong to this session */
 		if (RELATION_IS_OTHER_TEMP(relation))
@@ -4936,6 +5130,19 @@ ATController(AlterTableStmt *parsetree,
 	List	   *wqueue = NIL;
 	ListCell   *lcmd;
 
+	/*
+	 * For a global temporary table, refuse the ALTER TABLE outright if any
+	 * peer session has live per-session storage.  Their data was written
+	 * against the existing schema, so a column type change, NOT NULL flip,
+	 * new check constraint, unique/primary key, etc., could invalidate it.
+	 * The session-level AccessShareLock acquired in GttInitSessionStorage is
+	 * dropped by LockReleaseAll(allLocks=true) on a peer's transaction abort,
+	 * so the lock alone cannot keep us out -- the shared sessions registry
+	 * does.
+	 */
+	if (RelationIsGlobalTemp(rel))
+		GttCheckAlterable(RelationGetRelid(rel));
+
 	/* Phase 1: preliminary examination of commands, create work queue */
 	foreach(lcmd, cmds)
 	{
@@ -6004,6 +6211,21 @@ ATRewriteTables(AlterTableStmt *parsetree, List **wqueue, LOCKMODE lockmode,
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("cannot rewrite temporary tables of other sessions")));
+
+			/*
+			 * A table rewrite rotates the catalog relfilenode.  For a GTT,
+			 * every session's per-session storage is keyed by the catalog
+			 * relfilenode, so rotating it would leave other sessions pointing
+			 * at files that no longer exist or at the wrong generation of the
+			 * table.  Block rewrites for GTTs along with the other
+			 * relfilenode-rotating commands (CLUSTER / REINDEX / SET
+			 * TABLESPACE / SET LOGGED|UNLOGGED).
+			 */
+			if (RelationIsGlobalTemp(OldHeap))
+				ereport(ERROR,
+						errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot rewrite global temporary table \"%s\"",
+							   RelationGetRelationName(OldHeap)));
 
 			/*
 			 * Select destination tablespace (same as original unless user
@@ -10234,6 +10456,12 @@ ATAddForeignKeyConstraint(List **wqueue, AlteredTableInfo *tab, Relation rel,
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
 						 errmsg("constraints on temporary tables must involve temporary tables of this session")));
+			break;
+		case RELPERSISTENCE_GLOBAL_TEMP:
+			if (pkrel->rd_rel->relpersistence != RELPERSISTENCE_GLOBAL_TEMP)
+				ereport(ERROR,
+						errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+						errmsg("constraints on global temporary tables may reference only global temporary tables"));
 			break;
 	}
 
@@ -16873,6 +17101,18 @@ ATPrepSetTableSpace(AlteredTableInfo *tab, Relation rel, const char *tablespacen
 {
 	Oid			tablespaceId;
 
+	/*
+	 * SET TABLESPACE rewrites the file and assigns a new relfilenode.  For
+	 * GTTs the catalog relfilenode is the stem of every session's local file
+	 * name, so rotating it would desynchronize all other sessions'
+	 * per-session storage mappings.
+	 */
+	if (RelationIsGlobalTemp(rel))
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("cannot change tablespace of global temporary table \"%s\"",
+					   RelationGetRelationName(rel)));
+
 	/* Check that the tablespace exists */
 	tablespaceId = get_tablespace_oid(tablespacename, false);
 
@@ -16915,6 +17155,9 @@ ATExecSetRelOptions(Relation rel, List *defList, AlterTableType operation,
 
 	if (defList == NIL && operation != AT_ReplaceRelOptions)
 		return;					/* nothing to do */
+
+	/* Reject direct SET/RESET of internal GTT reloptions */
+	CheckInternalGttReloption(defList);
 
 	pgclass = table_open(RelationRelationId, RowExclusiveLock);
 
@@ -17537,6 +17780,23 @@ ATExecAddInherit(Relation child_rel, RangeVar *parent, LOCKMODE lockmode)
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("cannot inherit from temporary relation \"%s\"",
 						RelationGetRelationName(parent_rel))));
+
+	/*
+	 * GTTs mix neither with permanent nor with local temporary relations. See
+	 * MergeAttributes() for the CREATE TABLE side of this rule.
+	 */
+	if (RelationIsGlobalTemp(parent_rel) &&
+		child_rel->rd_rel->relpersistence != RELPERSISTENCE_GLOBAL_TEMP)
+		ereport(ERROR,
+				errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				errmsg("cannot inherit from global temporary relation \"%s\"",
+					   RelationGetRelationName(parent_rel)));
+	if (parent_rel->rd_rel->relpersistence != RELPERSISTENCE_GLOBAL_TEMP &&
+		RelationIsGlobalTemp(child_rel))
+		ereport(ERROR,
+				errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				errmsg("cannot inherit into global temporary relation \"%s\"",
+					   RelationGetRelationName(child_rel)));
 
 	/* If parent rel is temp, it must belong to this session */
 	if (RELATION_IS_OTHER_TEMP(parent_rel))
@@ -19086,6 +19346,13 @@ ATPrepChangePersistence(AlteredTableInfo *tab, Relation rel, bool toLogged)
 					 errmsg("cannot change logged status of table \"%s\" because it is temporary",
 							RelationGetRelationName(rel)),
 					 errtable(rel)));
+			break;
+		case RELPERSISTENCE_GLOBAL_TEMP:
+			ereport(ERROR,
+					errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+					errmsg("cannot change logged status of table \"%s\" because it is a global temporary table",
+						   RelationGetRelationName(rel)),
+					errtable(rel));
 			break;
 		case RELPERSISTENCE_PERMANENT:
 			if (toLogged)
@@ -20685,20 +20952,34 @@ ATExecAttachPartition(List **wqueue, Relation rel, PartitionCmd *cmd,
 						   RelationGetRelationName(attachrel))));
 
 	/* If the parent is permanent, so must be all of its partitions. */
-	if (rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP &&
-		attachrel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+	if (!RELPERSISTENCE_IS_LOCAL(rel->rd_rel->relpersistence) &&
+		RELPERSISTENCE_IS_LOCAL(attachrel->rd_rel->relpersistence))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("cannot attach a temporary relation as partition of permanent relation \"%s\"",
 						RelationGetRelationName(rel))));
 
 	/* Temp parent cannot have a partition that is itself not a temp */
-	if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP &&
-		attachrel->rd_rel->relpersistence != RELPERSISTENCE_TEMP)
+	if (RELPERSISTENCE_IS_LOCAL(rel->rd_rel->relpersistence) &&
+		!RELPERSISTENCE_IS_LOCAL(attachrel->rd_rel->relpersistence))
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("cannot attach a permanent relation as partition of temporary relation \"%s\"",
 						RelationGetRelationName(rel))));
+
+	/* GTT and local-temp cannot mix as partition parent/child */
+	if (RelationIsGlobalTemp(rel) &&
+		attachrel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+		ereport(ERROR,
+				errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				errmsg("cannot attach a local temporary relation as partition of global temporary relation \"%s\"",
+					   RelationGetRelationName(rel)));
+	if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP &&
+		RelationIsGlobalTemp(attachrel))
+		ereport(ERROR,
+				errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				errmsg("cannot attach a global temporary relation as partition of local temporary relation \"%s\"",
+					   RelationGetRelationName(rel)));
 
 	/* If the parent is temp, it must belong to this session */
 	if (RELATION_IS_OTHER_TEMP(rel))
@@ -22784,6 +23065,20 @@ createPartitionTable(List **wqueue, RangeVar *newPartName,
 		ereport(ERROR,
 				errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				errmsg("cannot create a permanent relation as partition of temporary relation \"%s\"",
+					   RelationGetRelationName(parent_rel)));
+
+	/*
+	 * Splitting or merging partitions of a global temporary table is not
+	 * supported.  The new partition created here would not inherit the
+	 * parent's global temporary persistence, so it would be given permanent,
+	 * cluster-wide storage underneath a parent whose data is per-session.
+	 * Reject the command rather than silently creating such an inconsistent
+	 * partition (this function is only reached from SPLIT/MERGE PARTITION).
+	 */
+	if (parent_relform->relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("cannot split or merge partitions of global temporary table \"%s\"",
 					   RelationGetRelationName(parent_rel)));
 
 	/* Create the relation. */

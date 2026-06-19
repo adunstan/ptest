@@ -40,6 +40,7 @@
 #include "storage/read_stream.h"
 #include "utils/rel.h"
 #include "utils/varlena.h"
+#include "catalog/storage_gtt.h"
 
 
 /*
@@ -221,6 +222,7 @@ pgstatindex_impl(Relation rel, FunctionCallInfo fcinfo)
 	BlockRangeReadStreamPrivate p;
 	ReadStream *stream;
 	BlockNumber startblk;
+	bool		materialized;
 
 	if (!IS_INDEX(rel) || !IS_BTREE(rel))
 		ereport(ERROR,
@@ -251,8 +253,19 @@ pgstatindex_impl(Relation rel, FunctionCallInfo fcinfo)
 						RelationGetRelationName(rel))));
 
 	/*
+	 * A global temporary table's per-session index storage may not have been
+	 * materialized in this session; there is then no metapage to read and
+	 * nothing to report beyond zeros.
+	 */
+	materialized = !RelationIsGlobalTemp(rel) ||
+		GttSessionIndexUsable(RelationGetRelid(rel));
+
+	memset(&indexStat, 0, sizeof(indexStat));
+
+	/*
 	 * Read metapage
 	 */
+	if (materialized)
 	{
 		Buffer		buffer = ReadBufferExtended(rel, MAIN_FORKNUM, 0, RBM_NORMAL, bstrategy);
 		Page		page = BufferGetPage(buffer);
@@ -279,11 +292,11 @@ pgstatindex_impl(Relation rel, FunctionCallInfo fcinfo)
 	/*
 	 * Scan all blocks except the metapage (0th page) using streaming reads
 	 */
-	nblocks = RelationGetNumberOfBlocks(rel);
+	nblocks = materialized ? RelationGetNumberOfBlocks(rel) : 0;
 	startblk = BTREE_METAPAGE + 1;
 
 	p.current_blocknum = startblk;
-	p.last_exclusive = nblocks;
+	p.last_exclusive = Max(nblocks, startblk);
 
 	/*
 	 * It is safe to use batchmode as block_range_read_stream_cb takes no
@@ -368,6 +381,7 @@ pgstatindex_impl(Relation rel, FunctionCallInfo fcinfo)
 		values[j++] = psprintf("%d", indexStat.version);
 		values[j++] = psprintf("%d", indexStat.level);
 		values[j++] = psprintf(INT64_FORMAT,
+							   !materialized ? (int64) 0 :
 							   (1 + /* include the metapage in index_size */
 								indexStat.leaf_pages +
 								indexStat.internal_pages +
@@ -564,19 +578,27 @@ pgstatginindex_internal(Oid relid, FunctionCallInfo fcinfo)
 				 errmsg("index \"%s\" is not valid",
 						RelationGetRelationName(rel))));
 
+	memset(&stats, 0, sizeof(stats));
+
 	/*
-	 * Read metapage
+	 * Read metapage -- unless this is a global temporary table's index whose
+	 * per-session storage has not been materialized; that has no metapage and
+	 * nothing to report beyond zeros.
 	 */
-	buffer = ReadBuffer(rel, GIN_METAPAGE_BLKNO);
-	LockBuffer(buffer, GIN_SHARE);
-	page = BufferGetPage(buffer);
-	metadata = GinPageGetMeta(page);
+	if (!RelationIsGlobalTemp(rel) ||
+		GttSessionIndexUsable(RelationGetRelid(rel)))
+	{
+		buffer = ReadBuffer(rel, GIN_METAPAGE_BLKNO);
+		LockBuffer(buffer, GIN_SHARE);
+		page = BufferGetPage(buffer);
+		metadata = GinPageGetMeta(page);
 
-	stats.version = metadata->ginVersion;
-	stats.pending_pages = metadata->nPendingPages;
-	stats.pending_tuples = metadata->nPendingHeapTuples;
+		stats.version = metadata->ginVersion;
+		stats.pending_pages = metadata->nPendingPages;
+		stats.pending_tuples = metadata->nPendingHeapTuples;
 
-	UnlockReleaseBuffer(buffer);
+		UnlockReleaseBuffer(buffer);
+	}
 	relation_close(rel, AccessShareLock);
 
 	/*
@@ -654,16 +676,26 @@ pgstathashindex(PG_FUNCTION_ARGS)
 				 errmsg("index \"%s\" is not valid",
 						RelationGetRelationName(rel))));
 
-	/* Get the information we need from the metapage. */
+	/*
+	 * Get the information we need from the metapage -- unless this is a
+	 * global temporary table's index whose per-session storage has not been
+	 * materialized; that has no metapage and nothing to report beyond zeros.
+	 */
 	memset(&stats, 0, sizeof(stats));
-	metabuf = _hash_getbuf(rel, HASH_METAPAGE, HASH_READ, LH_META_PAGE);
-	metap = HashPageGetMeta(BufferGetPage(metabuf));
-	stats.version = metap->hashm_version;
-	stats.space_per_page = metap->hashm_bsize;
-	_hash_relbuf(rel, metabuf);
+	if (!RelationIsGlobalTemp(rel) ||
+		GttSessionIndexUsable(RelationGetRelid(rel)))
+	{
+		metabuf = _hash_getbuf(rel, HASH_METAPAGE, HASH_READ, LH_META_PAGE);
+		metap = HashPageGetMeta(BufferGetPage(metabuf));
+		stats.version = metap->hashm_version;
+		stats.space_per_page = metap->hashm_bsize;
+		_hash_relbuf(rel, metabuf);
 
-	/* Get the current relation length */
-	nblocks = RelationGetNumberOfBlocks(rel);
+		/* Get the current relation length */
+		nblocks = RelationGetNumberOfBlocks(rel);
+	}
+	else
+		nblocks = 0;
 
 	/* prepare access strategy for this index */
 	bstrategy = GetAccessStrategy(BAS_BULKREAD);
@@ -672,7 +704,7 @@ pgstathashindex(PG_FUNCTION_ARGS)
 	startblk = HASH_METAPAGE + 1;
 
 	p.current_blocknum = startblk;
-	p.last_exclusive = nblocks;
+	p.last_exclusive = Max(nblocks, startblk);
 
 	/*
 	 * It is safe to use batchmode as block_range_read_stream_cb takes no

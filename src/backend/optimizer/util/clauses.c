@@ -965,12 +965,32 @@ max_parallel_hazard_walker(Node *node, max_parallel_hazard_context *context)
 	else if (IsA(node, Query))
 	{
 		Query	   *query = (Query *) node;
+		ListCell   *lc;
 
 		/* SELECT FOR UPDATE/SHARE must be treated as unsafe */
 		if (query->rowMarks != NULL)
 		{
 			context->max_hazard = PROPARALLEL_UNSAFE;
 			return true;
+		}
+
+		/*
+		 * A global temporary table has per-session, backend-local storage
+		 * that parallel workers cannot see, and that storage may have to be
+		 * created on first access -- which is impossible in parallel mode.
+		 * Referencing one therefore makes the query parallel-unsafe, so that
+		 * parallel mode is never imposed on it (e.g. by debug_parallel_query).
+		 */
+		foreach(lc, query->rtable)
+		{
+			RangeTblEntry *rte = lfirst_node(RangeTblEntry, lc);
+
+			if (rte->rtekind == RTE_RELATION &&
+				get_rel_persistence(rte->relid) == RELPERSISTENCE_GLOBAL_TEMP)
+			{
+				context->max_hazard = PROPARALLEL_UNSAFE;
+				return true;
+			}
 		}
 
 		/* Recurse into subselects */

@@ -561,11 +561,11 @@ XLogSimpleInsertInt64(RmgrId rmid, uint8 info, int64 value)
 XLogRecPtr
 XLogGetFakeLSN(Relation rel)
 {
-	if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+	if (RELPERSISTENCE_IS_LOCAL(rel->rd_rel->relpersistence))
 	{
 		/*
-		 * Temporary relations are only accessible in our session, so a simple
-		 * backend-local counter will do.
+		 * Temporary and global temporary relations are only accessible within
+		 * our session, so a simple backend-local counter will do.
 		 */
 		static XLogRecPtr counter = FirstNormalUnloggedLSN;
 

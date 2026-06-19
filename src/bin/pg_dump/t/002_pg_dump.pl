@@ -4988,7 +4988,35 @@ my %tests = (
 			no_table_access_method => 1,
 			only_dump_measurement => 1,
 		},
-	});
+	},
+
+	'CREATE GLOBAL TEMPORARY TABLE test_gtt' => {
+		create_order => 101,
+		create_sql => 'CREATE GLOBAL TEMPORARY TABLE public.test_gtt (
+						   id serial,
+						   val text
+					   );
+					   INSERT INTO public.test_gtt (val) VALUES (\'gtt_data\');',
+		regexp => qr/^
+			\QCREATE GLOBAL TEMPORARY TABLE public.test_gtt (\E\n
+			\s+\Qid integer NOT NULL,\E\n
+			\s+\Qval text\E\n
+			\Q)\E\n
+			\QON COMMIT PRESERVE ROWS;\E
+			/xm,
+		like =>
+		  { %full_runs, section_pre_data => 1, },
+	},
+
+	'CREATE GLOBAL TEMPORARY SEQUENCE test_gtt_id_seq' => {
+		regexp => qr/^
+			\QCREATE GLOBAL TEMPORARY SEQUENCE public.test_gtt_id_seq\E
+			/xm,
+		like =>
+		  { %full_runs, section_pre_data => 1, },
+	},
+
+);
 
 #########################################
 # Create a PG instance to test actually dumping from

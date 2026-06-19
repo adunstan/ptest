@@ -54,6 +54,7 @@
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
 #include "catalog/storage.h"
+#include "catalog/storage_gtt.h"
 #include "commands/tablecmds.h"
 #include "commands/typecmds.h"
 #include "common/int.h"
@@ -344,6 +345,14 @@ heap_create(const char *relname,
 		 */
 		if (!RelFileNumberIsValid(relfilenumber))
 			relfilenumber = relid;
+
+		/*
+		 * Global temporary tables need a relfilenode in the catalog (used as
+		 * the basis for per-session file naming), but don't create shared
+		 * storage -- per-session storage is created lazily.
+		 */
+		if (relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+			create_storage = false;
 	}
 
 	/*
@@ -1535,9 +1544,15 @@ heap_create_with_catalog(const char *relname,
 	StoreConstraints(new_rel_desc, cooked_constraints, is_internal);
 
 	/*
-	 * If there's a special on-commit action, remember it
+	 * If there's a special on-commit action, remember it.  Global temporary
+	 * tables manage their ON COMMIT DELETE ROWS truncation through
+	 * PreCommit_gtt_on_commit instead, since heap_truncate would escalate to
+	 * AccessExclusiveLock at every commit, blocking on peers' ordinary
+	 * transaction-level locks even though only this session's private storage
+	 * is affected; skip the generic registration here for GTTs.
 	 */
-	if (oncommit != ONCOMMIT_NOOP)
+	if (oncommit != ONCOMMIT_NOOP &&
+		relpersistence != RELPERSISTENCE_GLOBAL_TEMP)
 		register_on_commit_action(relid, oncommit);
 
 	/*
@@ -1900,6 +1915,24 @@ heap_drop_with_catalog(Oid relid)
 	 */
 	if (RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
 		RelationDropStorage(rel);
+
+	/*
+	 * For global temporary tables, also schedule release of the per-session
+	 * hash entry and the session-level lock.  Physical file unlinking goes
+	 * through the normal PendingRelDelete path above (rd_locator has been
+	 * redirected to the per-session locator).
+	 *
+	 * Before scheduling cleanup, consult the shared-memory sessions registry:
+	 * if any other backend has live per-session storage for this GTT, refuse
+	 * the drop.  We hold AccessExclusiveLock, so no other session can enter
+	 * GttInitSessionStorage (which would add to the registry) until we
+	 * complete or abort.
+	 */
+	if (RelationIsGlobalTemp(rel))
+	{
+		GttCheckDroppable(relid);
+		GttScheduleDropSessionStorage(relid);
+	}
 
 	/* ensure that stats are dropped if transaction commits */
 	pgstat_drop_relation(rel);

@@ -30,6 +30,7 @@
 #include "storage/bufmgr.h"
 #include "storage/shmem.h"
 #include "storage/smgr.h"
+#include "catalog/storage_gtt.h"
 
 /*
  * Constants to control the behavior of block allocation to parallel workers
@@ -681,6 +682,11 @@ uint64
 table_block_relation_size(Relation rel, ForkNumber forkNumber)
 {
 	uint64		nblocks = 0;
+
+	/* See RelationGetNumberOfBlocksInFork: unmaterialized GTTs are empty. */
+	if (RelationIsGlobalTemp(rel) &&
+		!GttHasSessionStorage(RelationGetRelid(rel)))
+		return 0;
 
 	/* InvalidForkNumber indicates returning the size for all forks */
 	if (forkNumber == InvalidForkNumber)

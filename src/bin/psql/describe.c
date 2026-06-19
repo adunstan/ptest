@@ -2138,6 +2138,9 @@ describeOneTableDetails(const char *schemaname,
 			if (tableinfo.relpersistence == RELPERSISTENCE_UNLOGGED)
 				printfPQExpBuffer(&title, _("Unlogged table \"%s.%s\""),
 								  schemaname, relationname);
+			else if (tableinfo.relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+				printfPQExpBuffer(&title, _("Global temporary table \"%s.%s\""),
+								  schemaname, relationname);
 			else
 				printfPQExpBuffer(&title, _("Table \"%s.%s\""),
 								  schemaname, relationname);
@@ -2153,6 +2156,9 @@ describeOneTableDetails(const char *schemaname,
 		case RELKIND_INDEX:
 			if (tableinfo.relpersistence == RELPERSISTENCE_UNLOGGED)
 				printfPQExpBuffer(&title, _("Unlogged index \"%s.%s\""),
+								  schemaname, relationname);
+			else if (tableinfo.relpersistence == RELPERSISTENCE_GLOBAL_TEMP)
+				printfPQExpBuffer(&title, _("Global temporary index \"%s.%s\""),
 								  schemaname, relationname);
 			else
 				printfPQExpBuffer(&title, _("Index \"%s.%s\""),
@@ -4311,10 +4317,12 @@ listTables(const char *tabtypes, const char *pattern, bool verbose, bool showSys
 						  "WHEN " CppAsString2(RELPERSISTENCE_PERMANENT) " THEN '%s' "
 						  "WHEN " CppAsString2(RELPERSISTENCE_TEMP) " THEN '%s' "
 						  "WHEN " CppAsString2(RELPERSISTENCE_UNLOGGED) " THEN '%s' "
+						  "WHEN " CppAsString2(RELPERSISTENCE_GLOBAL_TEMP) " THEN '%s' "
 						  "END as \"%s\"",
 						  gettext_noop("permanent"),
 						  gettext_noop("temporary"),
 						  gettext_noop("unlogged"),
+						  gettext_noop("global temporary"),
 						  gettext_noop("Persistence"));
 		translate_columns[cols_so_far] = true;
 

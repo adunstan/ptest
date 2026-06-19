@@ -3536,14 +3536,27 @@ transformCreateTableAsStmt(ParseState *pstate, CreateTableAsStmt *stmt)
 		/*
 		 * Check whether any temporary database objects are used in the
 		 * creation query. It would be hard to refresh data or incrementally
-		 * maintain it if a source disappeared.
+		 * maintain it if a source disappeared.  Global temporary tables
+		 * count: their definition persists, but their contents are
+		 * session-private, so materializing them into a permanent relation
+		 * would capture (and publish) one session's private rows.
 		 */
-		if (query_uses_temp_object(query, &temp_object))
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("materialized views must not use temporary objects"),
-					 errdetail("This view depends on temporary %s.",
-							   getObjectDescription(&temp_object, false))));
+		if (query_uses_temp_object(query, true, &temp_object))
+		{
+			if (temp_object.classId == RelationRelationId &&
+				get_rel_persistence(temp_object.objectId) == RELPERSISTENCE_GLOBAL_TEMP)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("materialized views must not use temporary objects"),
+						 errdetail("This view depends on global temporary table \"%s\".",
+								   get_rel_name(temp_object.objectId))));
+			else
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("materialized views must not use temporary objects"),
+						 errdetail("This view depends on temporary %s.",
+								   getObjectDescription(&temp_object, false))));
+		}
 
 		/*
 		 * A materialized view would either need to save parameters for use in

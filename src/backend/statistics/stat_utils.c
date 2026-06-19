@@ -47,6 +47,25 @@
 static Node *statatt_get_index_expr(Relation rel, int attnum);
 
 /*
+ * stats_check_not_global_temp
+ *		Reject statistics import for a global temporary table.
+ *
+ * A GTT's statistics are per-session (established by running ANALYZE in
+ * each session); its shared pg_class/pg_statistic rows must stay
+ * unpopulated, so the stats import functions cannot apply to it.
+ */
+void
+stats_check_not_global_temp(Oid reloid, const char *relname)
+{
+	if (get_rel_persistence(reloid) == RELPERSISTENCE_GLOBAL_TEMP)
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("cannot modify shared statistics for global temporary table \"%s\"",
+					   relname),
+				errhint("Run ANALYZE in each session that uses the table."));
+}
+
+/*
  * Ensure that a given argument is not null.
  */
 void

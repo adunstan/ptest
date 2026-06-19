@@ -107,6 +107,7 @@
 #include "catalog/pg_operator.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_statistic_ext.h"
+#include "catalog/storage_gtt.h"
 #include "executor/nodeAgg.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
@@ -5830,11 +5831,10 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
 						else if (index->indpred == NIL)
 						{
 							vardata->statsTuple =
-								SearchSysCache3(STATRELATTINH,
-												ObjectIdGetDatum(index->indexoid),
-												Int16GetDatum(pos + 1),
-												BoolGetDatum(false));
-							vardata->freefunc = ReleaseSysCache;
+								SearchStats(index->indexoid,
+											pos + 1, false,
+											true,
+											&vardata->freefunc);
 
 							if (HeapTupleIsValid(vardata->statsTuple))
 							{
@@ -6060,11 +6060,11 @@ examine_simple_variable(PlannerInfo *root, Var *var,
 		 * Plain table or parent of an inheritance appendrel, so look up the
 		 * column in pg_statistic
 		 */
-		vardata->statsTuple = SearchSysCache3(STATRELATTINH,
-											  ObjectIdGetDatum(rte->relid),
-											  Int16GetDatum(var->varattno),
-											  BoolGetDatum(rte->inh));
-		vardata->freefunc = ReleaseSysCache;
+		vardata->statsTuple = SearchStats(rte->relid,
+										  var->varattno,
+										  rte->inh,
+										  true,
+										  &vardata->freefunc);
 
 		if (HeapTupleIsValid(vardata->statsTuple))
 		{
@@ -6537,11 +6537,10 @@ examine_indexcol_variable(PlannerInfo *root, IndexOptInfo *index,
 		}
 		else
 		{
-			vardata->statsTuple = SearchSysCache3(STATRELATTINH,
-												  ObjectIdGetDatum(relid),
-												  Int16GetDatum(colnum),
-												  BoolGetDatum(rte->inh));
-			vardata->freefunc = ReleaseSysCache;
+			vardata->statsTuple = SearchStats(relid, colnum,
+											  rte->inh,
+											  true,
+											  &vardata->freefunc);
 		}
 	}
 	else
@@ -6563,11 +6562,9 @@ examine_indexcol_variable(PlannerInfo *root, IndexOptInfo *index,
 		}
 		else
 		{
-			vardata->statsTuple = SearchSysCache3(STATRELATTINH,
-												  ObjectIdGetDatum(relid),
-												  Int16GetDatum(colnum),
-												  BoolGetDatum(false));
-			vardata->freefunc = ReleaseSysCache;
+			vardata->statsTuple = SearchStats(relid, colnum, false,
+											  true,
+											  &vardata->freefunc);
 		}
 	}
 }
@@ -9117,11 +9114,9 @@ brincostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 			else
 			{
 				vardata.statsTuple =
-					SearchSysCache3(STATRELATTINH,
-									ObjectIdGetDatum(rte->relid),
-									Int16GetDatum(attnum),
-									BoolGetDatum(false));
-				vardata.freefunc = ReleaseSysCache;
+					SearchStats(rte->relid, attnum, false,
+								true,
+								&vardata.freefunc);
 			}
 		}
 		else
@@ -9147,11 +9142,10 @@ brincostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 			}
 			else
 			{
-				vardata.statsTuple = SearchSysCache3(STATRELATTINH,
-													 ObjectIdGetDatum(index->indexoid),
-													 Int16GetDatum(attnum),
-													 BoolGetDatum(false));
-				vardata.freefunc = ReleaseSysCache;
+				vardata.statsTuple =
+					SearchStats(index->indexoid, attnum, false,
+								true,
+								&vardata.freefunc);
 			}
 		}
 

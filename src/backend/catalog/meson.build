@@ -34,6 +34,7 @@ backend_sources += files(
   'pg_tablespace.c',
   'pg_type.c',
   'storage.c',
+  'storage_gtt.c',
   'toasting.c',
 )
 
